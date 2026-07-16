@@ -9,6 +9,20 @@ A pacing note: the agentic tooling landscape shifts monthly (mid-2026). Treat ev
 
 ---
 
+# How to use this plan (the method matters as much as the syllabus)
+
+Reading notes builds *recognition*; engineers at Google/Anthropic/OpenAI/Microsoft run on *recall + production judgment*. A syllabus alone won't close that gap — the weekly loop below is what does. Run every week through these five moves, in order:
+
+1. **Learn with calibrated depth.** Generate notes for the week's topics using `context.txt`. Tag each concept **[CORE] / [WORKING] / [AWARE]** and study to the tier — go to the metal on CORE, treat AWARE as a named black box. Don't try to go maximally deep on everything; knowing what *not* to open is itself a senior skill.
+2. **Verify against primary sources.** For every non-obvious claim, confirm it against the official docs / PEP / RFC / paper / source code the notes cite. LLM-generated notes contain confident, subtle errors; catching them *is* part of the learning, and it trains the habit those companies expect.
+3. **Build the weekly deliverable.** Every week already ships a runnable artifact — do it, don't skip it. Your Git history across 24 weeks *is* your proof of skill. A concept you haven't built with, you don't actually know.
+4. **Read real production code.** Once per phase, read the source of a tool you rely on (FastAPI, Pydantic, the Anthropic/OpenAI SDK, LangGraph, Durable Functions). Reading how experts actually write it is how you absorb taste and idiom that notes can't teach.
+5. **Recall and teach back.** End each week by answering the notes' active-recall questions *from memory* and explaining the week's bridge aloud in 60 seconds as if to a colleague. Add the flashcards to a spaced-repetition system and review across weeks. If you can't teach it without looking, loop back to step 1.
+
+Rule of thumb: **if a week produced only notes and no running code you can demo and no concept you can explain aloud, that week didn't land — redo the build and the teach-back before moving on.**
+
+---
+
 # PHASE 0 — Environment & Mental Models (Week 1)
 
 Before anything else, get the modern toolchain and the two foundational mental models in place.
