@@ -800,39 +800,56 @@ If any criterion is not met, continue expanding (or trimming, for bloat) until i
 
 # OUTPUT FORMAT
 
-For each topic, follow this structure:
+**Organize by Parts, not by one rigid global checklist.** A single flat 1-to-N section list forces unrelated sub-topics to be interleaved and makes the notes tiring to learn from. Instead, structure every note the way a great lecturer structures a course: split the topic into its natural **major sub-topics**, make each one a **Part**, and take each Part *from scratch to mastery on its own* before moving to the next. Then close with shared wrap-up sections that tie the Parts together.
 
-1. Overview
-2. Motivation
-3. Historical Background
-4. Problem Statement
-5. First Principles
-6. Fundamental Building Blocks
-7. Terminology
-8. Intuition
-9. Analogies
-10. Visual Diagrams
-11. Internal Architecture
-12. Step-by-Step Execution
-13. Under the Hood
-14. Data Flow
-15. Memory & Runtime Behavior
-16. Performance Analysis
-17. Trade-offs
-18. Comparisons
-19. Failure Modes
-20. Industry Usage
-21. Best Practices
-22. Common Mistakes
-23. Interview Questions
-24. Practice Questions
-25. Cheat Sheet
-26. Build This — a hands-on task with a runnable "definition of done" (the concept exercised in real code)
-27. Active Recall & Self-Test — questions answered from memory, plus a 60-second "explain it aloud" teach-back prompt
-28. Primary Sources — official docs / PEPs / RFCs / papers / source code to verify against and go deeper
-29. Key Takeaways
-30. Summary
-31. Suggested Next Topics
+## Overall document shape
+
+```
+# <Topic Title>
+> Short framing note: what this covers, who it's for, and the ONE idea that unites the Parts.
+
+# PART A — <first major sub-topic>
+   (runs through the per-Part flow below)
+
+# PART B — <second major sub-topic>
+   (runs through the per-Part flow below)
+
+# PART C … (as many Parts as the topic naturally has — often 1-4)
+
+# THE BRIDGE — how the Parts connect into one coherent mental model
+# <Topic-wide wrap-up sections>
+```
+
+* Choose Parts by **natural conceptual boundaries** (e.g. "the Python toolchain" vs. "the two mental models"), not arbitrarily. A small topic may be a single Part; that's fine — don't invent Parts.
+* If the Parts share a unifying insight, state it in the opening framing note and again in an explicit **Bridge** section near the end. The Bridge is where isolated facts become one mental model (see KNOWLEDGE CONNECTIONS).
+
+## The per-Part flow (each Part moves through this progression)
+
+Within each Part, take the reader from zero to deep understanding using the TEACHING STYLE progression. Cover these elements **in an order that flows naturally for that Part** — you don't need every element for every Part, and you may merge or reorder them, but nothing load-bearing may be silently dropped:
+
+* Overview & motivation (why this Part exists; the problem before it)
+* First principles & core terminology (defined before use)
+* Intuition & analogies (with where each analogy breaks)
+* Visual diagrams (ASCII/Markdown)
+* Internal architecture, step-by-step execution & under-the-hood (for [CORE] concepts)
+* Data flow, memory & runtime behavior
+* Performance, trade-offs & comparisons (use tables)
+* Failure modes, industry usage, best practices & common mistakes
+* Interview questions & practice questions for that Part
+
+Tag each concept's depth tier (Rule 6) as you go.
+
+## Topic-wide wrap-up (once, at the end, covering all Parts)
+
+* **The Bridge** — how the Parts fit into one coherent model
+* **Cheat Sheet** — the whole topic in one glance
+* **Build This** — a hands-on task with a runnable "definition of done" that exercises the concepts in real code
+* **Active Recall & Self-Test** — questions answered from memory, plus a 60-second "explain it aloud" teach-back prompt
+* **Primary Sources** — official docs / PEPs / RFCs / papers / source code to verify against and go deeper
+* **Key Takeaways & Summary** — including the 10-second / 1-minute / 5-minute / expert-level explanations (see MEMORY RETENTION)
+* **Suggested Next Topics**
+
+The complete set of MEMORY RETENTION elements and every QUALITY CHECKLIST criterion must still be satisfied across the note as a whole — the Part structure is *how* they're organized, not permission to skip any of them.
 
 ---
 
