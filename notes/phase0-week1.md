@@ -1,23 +1,25 @@
 # Phase 0 — Week 1: Environment & the Two Foundational Mental Models
 
-> **What this covers:** the modern Python backend toolchain (Part A) and the two mental models every agentic system is built on (Part B).
-> **Who it's for:** a reader with zero prior knowledge — every term is defined before it's used.
-> **The one idea that unites both Parts:** *an LLM has no memory, so all state, memory, and durability are your backend's job. That is why backend rigor is a prerequisite for building agents — not a nice-to-have.*
+> **What this covers:** Part 1 is the modern Python **backend toolchain** (uv, Ruff, mypy, pytest, `pyproject.toml`, `src/` layout, lockfile, pre-commit/CI). Part 2 is the two **agentic-AI** mental models every agent is built on (a stateless LLM call; an agent as a `while` loop). Part 3 is the **Bridge**: how these two layers depend on and interlink into one system.
+> **Who it's for:** a reader with zero prior knowledge — every term is defined before it is used.
+> **The one idea that unites both layers:** *an LLM has no memory, so all state, memory, and durability are the backend's job. Backend rigor is therefore a prerequisite for building agents, not a nice-to-have.*
 >
 > **Depth tiers used below:** **[CORE]** = open every black box; **[WORKING]** = use it and know its tradeoffs, but treat its internals as a named black box; **[AWARE]** = know it exists and when to reach for it.
 
 ---
 
-# PART A — The Modern Python Toolchain
+# PART 1 — BACKEND
+
+*The modern Python toolchain: the machinery that makes your code reproducible, checked, and trustworthy on machines that are not yours.*
 
 ## Overview & motivation
 
-A **toolchain** is the set of programs that sit between *you writing code* and *code running correctly on someone else's machine*. Two everyday failures motivate the whole of Part A:
+A **toolchain** is the set of programs that sit between *you writing code* and *that code running correctly on someone else's machine*. Two everyday failures motivate this entire Part:
 
-1. **"It works on my machine."** Your code runs perfectly, then breaks for a teammate or a server because they have a slightly different package version or Python. This is a *reproducibility* failure — and it is entirely preventable.
+1. **"It works on my machine."** Your code runs perfectly, then breaks for a teammate or a server because they have a slightly different package version or Python interpreter. This is a *reproducibility* failure — and it is entirely preventable.
 2. **"I'll skip the check, it's too slow."** If linting or type-checking takes 10 seconds, you stop running it, and it catches nothing. Fast tools change behavior: a 50-millisecond check gets run on every save.
 
-The modern stack fixes both. Here is the whole thing at a glance (each row is explained below):
+The modern stack fixes both. Here is the whole thing at a glance — each row is explained below:
 
 | Job | Tool | Depth | One-line role |
 |---|---|---|---|
@@ -33,7 +35,7 @@ The modern stack fixes both. Here is the whole thing at a glance (each row is ex
 
 ## First principles & terminology
 
-*(Defined before use — nothing here assumes you've programmed before.)*
+*(Defined before use — nothing here assumes you have programmed before.)*
 
 - **Package** (a.k.a. *library*) — reusable code someone else wrote that your program uses (e.g. `fastapi`). A **dependency** is any package your code needs. Packages have their own dependencies — **transitive dependencies**.
 - **Environment** — "where installed packages live + which Python runs them." If every project shares one global environment, installing `requests` v2 for project X breaks project Y that needs v3.
@@ -86,7 +88,7 @@ Sequential (hope):        Resolver (proof):
 2. **Fetch metadata** for candidate versions; cached on disk, so repeat runs are near-instant.
 3. **Solve** with a **PubGrub-style backtracking resolver**: tentatively pick versions, detect a conflict, backtrack, and either converge on one consistent graph *or* emit a human-readable explanation of why none exists.
 4. **Write `uv.lock`** with exact versions + hashes.
-5. **Materialize the environment** — instead of re-downloading/re-copying, uv keeps a **global content-addressed cache** (files stored under the hash of their contents, so identical files are stored once) and **hard-links** them into the venv. This, plus being compiled **Rust**, is why it's fast.
+5. **Materialize the environment** — instead of re-downloading/re-copying, uv keeps a **global content-addressed cache** (files stored under the hash of their contents, so identical files are stored once) and **hard-links** them into the venv. This, plus being compiled **Rust**, is why it is fast.
 
 **Why Ruff is fast [WORKING]:** it parses each file **once** into an **AST** (Abstract Syntax Tree — a tree of the code's structure) and evaluates *all* rules in that single traversal, in parallel across files, as compiled Rust — versus a pile of separate Python tools each re-parsing the file.
 
@@ -189,9 +191,15 @@ jobs:
 ```
 From here, onboarding is two commands: `git clone …` then `uv sync`.
 
+## Data flow, memory & runtime behavior
+
+- **At rest (checked, not running):** `pyproject.toml` → resolver → `uv.lock` → materialized `.venv/`. Ruff and mypy read your source and produce diagnostics; nothing of yours executes.
+- **At runtime:** type hints are **erased** — they cost nothing while the program runs. The only runtime validation is Pydantic, which builds validator objects once and checks incoming data at the boundary.
+- **Caches that make it fast:** uv's content-addressed cache (on disk, shared across projects), mypy's incremental `.mypy_cache/`, Ruff's per-run in-memory AST. These are why the second run of everything is near-instant.
+
 ## Performance, trade-offs & comparisons
 
-- **Performance:** uv installs are near-instant on a warm cache (hard-links, not copies); Ruff is milliseconds/file; mypy is the slowest (a full inference engine) but caches incrementally in `.mypy_cache/`. First cold resolve is a backtracking search — usually fast, occasionally expensive on pathological constraints, which is *why* caching matters. Type hints are **erased at runtime** — they cost nothing while the program runs.
+- **Performance:** uv installs are near-instant on a warm cache (hard-links, not copies); Ruff is milliseconds/file; mypy is the slowest (a full inference engine) but caches incrementally. First cold resolve is a backtracking search — usually fast, occasionally expensive on pathological constraints, which is *why* caching matters.
 - **Trade-offs:** `--strict` slows initial coding but repays it in bugs caught early • pinned deps are stable but need deliberate updates for security patches • one opinionated tool means fewer knobs but you inherit its opinions.
 
 | Concern | Old tool(s) | Modern | Why switch |
@@ -209,7 +217,7 @@ From here, onboarding is two commands: `git clone …` then `uv sync`.
 - **Industry usage:** reproducible environments are *mandatory* in regulated/enterprise software — auditors and security scanners need the exact dependency graph (the lockfile) to flag a vulnerable transitive package precisely. `pyproject.toml` + committed lockfile is the emerging default.
 - **Common mistakes:** *beginner* — forgetting to commit the lockfile; *intermediate* — disabling mypy rules wholesale instead of fixing the type; *senior* — hook and CI running different commands.
 
-## Interview & practice questions (Part A)
+## Interview & practice questions (Part 1)
 
 1. What is the diamond dependency problem, and how does a resolver solve it?
 2. Difference between `pyproject.toml` dependencies and a lockfile?
@@ -221,13 +229,27 @@ From here, onboarding is two commands: `git clone …` then `uv sync`.
 
 ---
 
-# PART B — The Two Foundational Mental Models
+# PART 2 — AGENTIC AI
 
-> Get these *on paper* before touching any agent framework. Everything later in the curriculum is a variation on these two ideas.
+*The two mental models every agent is built on. Get them on paper before touching any framework — everything later in the curriculum is a variation on these two ideas.*
+
+> Throughout this Part, the **backend is a black box**: whenever "the backend stores / resends / executes" appears, that is the machinery from Part 1 (a reproducible, typed, tested service). Part 3 opens that box and wires the two together; here we only need to know it exists and is trustworthy.
+
+## Overview & motivation
+
+An LLM by itself can only produce text. It cannot remember a conversation, look anything up, or take an action in the world. Yet products built on LLMs *do* remember, *do* search, *do* act. Where does that capability come from? Not from the model — from the code around it. These two mental models name that code precisely, so you always know which capability is the model's and which is yours to build.
+
+## First principles & core terminology
+
+- **LLM** (Large Language Model) — a fixed mathematical function that maps a sequence of **tokens** (chunks of text) to a probability distribution over the next token.
+- **Stateless** — keeps *no memory* between calls; call it twice identically and the second call has no idea the first happened.
+- **Context window** — the maximum number of tokens the model can see in a single call. Finite.
+- **Agent** — ordinary code that repeatedly calls the LLM to decide and take actions until a goal is met.
+- **Tool** — a function the agent can invoke (search, read a file, call an API). The model only *emits a request* to use a tool; it never runs code itself.
 
 ## Mental Model 1 — An LLM call is a stateless input → output function **[CORE]**
 
-**First principles.** An **LLM** (Large Language Model) call takes text in and produces text out: `output = LLM(input)`. **Stateless** means it keeps *no memory* between calls — call it twice identically and the second call has no idea the first happened. Why: the model is a fixed mathematical function (frozen learned weights) mapping a sequence of **tokens** (chunks of text) to a probability distribution over the next token. Its *only* input is the text you send *this* call. There is no memory slot. (This falls out of the **Transformer** architecture — see Primary Sources.)
+**First principles.** An LLM call takes text in and produces text out: `output = LLM(input)`. It keeps no memory between calls. Why: the model is a fixed function (frozen learned weights) whose *only* input is the text you send *this* call. There is no memory slot. (This falls out of the **Transformer** architecture — see Primary Sources.)
 
 **Intuition.** A **brilliant amnesiac contractor**: total expertise, *zero* recollection of previous conversation. To continue, you must hand them the whole transcript, every time.
 
@@ -237,9 +259,9 @@ Turn 2: you send "What's my name?"      model sees ["What's my name?"]        �
         To fix, the BACKEND resends:    ["My name is Vinay.", "...", "What's my name?"] → "Vinay."
 ```
 
-**Under the hood — how the "illusion of memory" is built:**
+**Under the hood — how the "illusion of memory" is built (backend = black box from Part 1):**
 ```
- ┌─────────── YOUR BACKEND (stateful) ───────────┐
+ ┌─────────── BACKEND (stateful — see Part 1) ────┐
  │  history = [system, u1, a1, u2, a2, ...]       │
  │        │  append new user message              │
  │        ▼                                        │
@@ -257,16 +279,16 @@ Turn 2: you send "What's my name?"      model sees ["What's my name?"]        �
 
 **Why designed this way.** A stateless function can be load-balanced across thousands of servers because no request is pinned to a machine holding its session; behavior depends only on visible input (reproducible, debuggable); and the model *reasons* while the backend owns *state* — a clean split.
 
-**Consequences (the point of the week).** Memory is a **backend feature**, not a model feature. The **context window** (max tokens the model can see in one call) is finite, so growing history must eventually be summarized, truncated, or retrieved — the seed of the later "memory/RAG" topic. And cost/latency scale with resent history: every turn re-pays for the whole transcript.
+**Consequences (the point of the week).** Memory is a **backend feature**, not a model feature. The context window is finite, so growing history must eventually be summarized, truncated, or retrieved — the seed of the later "memory/RAG" topic. And cost/latency scale with resent history: every turn re-pays for the whole transcript.
 
 ## Mental Model 2 — An agent is a `while` loop around that function **[CORE]**
 
-**First principles.** An **agent** is ordinary code that repeatedly calls the LLM to decide and take actions until a goal is met: **perceive → reason → act → repeat → stop.** A single LLM call can only *say* things; to *do* things (search, read a file, call an API) and handle multi-step tasks, you wrap the call in a loop.
+**First principles.** An agent is ordinary code that repeatedly calls the LLM to decide and take actions until a goal is met: **perceive → reason → act → repeat → stop.** A single LLM call can only *say* things; to *do* things (search, read a file, call an API) and handle multi-step tasks, you wrap the call in a loop.
 
 **The loop, term by term:**
 - **Perceive** — read current state: the request, prior messages, and any *tool results* so far.
 - **Reason** — the LLM chooses the next action: "call tool X with these args" or "final answer."
-- **Act** — *your backend* executes the chosen **tool** (the model only *emits a request*; it can't run code) and captures the result.
+- **Act** — *the backend* executes the chosen tool (the model only *emits a request*; it can't run code) and captures the result.
 - **Repeat** — the result is appended to state and fed back (Model 1 in action).
 - **Stop** — the model answers instead of calling a tool, *or* a guard trips (max iterations / budget).
 
@@ -301,9 +323,10 @@ LOOP:
 
 **Examples.** *Beginner:* one `calculator` tool — "what's 17% of 2,340?" → model calls it → result fed back → model answers. *Real-world:* a coding agent — read file (tool) → edit (tool) → run tests (tool) → repeat until green. *Counter-example:* a single `LLM("summarize this")` call is **not** an agent — no loop, no tools, no state between steps.
 
-**Failure modes → recovery.** Assuming built-in memory (forgetting to resend history) → the model "forgets" • no max-iteration/budget guard → runaway loop + cost blowup • unbounded history → context-window overflow (summarize/truncate/retrieve) • trusting tool I/O without validation → crash deep in the loop (validate with Pydantic — Part A rigor *inside* the loop).
+## Performance, trade-offs & comparison
 
-## Comparison & confusions (Part B)
+- **Performance:** every loop iteration is a full model call over the *entire* accumulated state, so cost and latency grow with the number of steps *and* history length. Fewer, well-chosen tool calls beat many redundant ones.
+- **Trade-offs:** more autonomy (longer loops, more tools) means more capability but more ways to spiral, overspend, or take a wrong action — which is exactly why guards and (later) approval gates exist.
 
 | | Plain LLM call | Agent (loop) |
 |---|---|---|
@@ -312,9 +335,13 @@ LOOP:
 | State | none | accumulated in the backend across iterations |
 | Use when | single transform (summarize, classify) | multi-step tasks needing tools/decisions |
 
+## Failure modes & common confusions
+
+**Failure modes → recovery.** Assuming built-in memory (forgetting to resend history) → the model "forgets" • no max-iteration/budget guard → runaway loop + cost blowup • unbounded history → context-window overflow (summarize/truncate/retrieve) • trusting tool I/O without validation → crash deep in the loop (validate at the boundary — Part 1 rigor *inside* the loop).
+
 **Confusions settled:** the model *requests* tools, the backend *runs* them • the model doesn't remember — the backend resends • an agent isn't a special model, it's ordinary loop code around ordinary stateless calls.
 
-## Interview & practice questions (Part B)
+## Interview & practice questions (Part 2)
 
 1. Why is an LLM stateless, and what does that imply for building chat?
 2. How is "conversation memory" actually implemented?
@@ -324,47 +351,126 @@ LOOP:
 
 ---
 
-# THE BRIDGE — why Part A is a prerequisite, not a nicety
+# PART 3 — THE BRIDGE (how backend and agentic layers depend on and interlink)
 
-Because the LLM is stateless (Model 1) and the agent loops (Model 2), **every durable thing — conversation memory, tool-result history, retries, budgets, persistence between iterations — lives in your backend.** Notice the architecture is the *same split* in both Parts: a **stateful backend wrapped around a stateless computational core** (uv/typing/tests make that backend reproducible and validated; the mental models locate all state inside it). If your backend is sloppy — unreproducible env, untyped boundaries, no tests — your agent is unreliable *for reasons that have nothing to do with the model's intelligence.* That is why Week 1 forces backend rigor first: **an agent is only as trustworthy as the backend that runs its loop and holds its state.**
+*Where Part 1 and Part 2 stop being two separate skill sets and become one system. Every concept here references something already taught above — nothing new is introduced.*
+
+## Overview & motivation — why this Part exists
+
+Parts 1 and 2 can each feel self-contained: one is "Python tooling," the other is "how LLMs work." Learned in isolation, they produce a common failure — an engineer who understands agents conceptually but ships one that is flaky, unreproducible, and impossible to debug, *for reasons that have nothing to do with the model's intelligence.* This Part exists to prevent that: it shows that the agentic layer (Part 2) **runs on top of** and **depends on** the backend layer (Part 1), and that the quality of the second is capped by the quality of the first.
+
+## First principles — the single shared shape
+
+Reduce both Parts to their skeleton and they are the *same* architecture:
+
+> **A stateful backend wrapped around a stateless computational core.**
+
+- In **Part 1**, the stateless core is the *code you run* and the backend machinery (uv/typing/tests) makes that surrounding system reproducible and validated.
+- In **Part 2**, the stateless core is the *LLM call* (Model 1) and the backend is what holds all state across the loop (Model 2).
+
+Recognizing this one shape is the payoff of Week 1: agent frameworks you meet later are all *variations on where this stateful/stateless boundary is drawn and who runs it.*
+
+## Intuition & analogy
+
+The LLM is a **brilliant amnesiac contractor** (Part 2). The backend (Part 1) is the **office around them**: the filing cabinet that remembers every past conversation, the assistant who re-briefs them each morning, the phone lines they use to actually *do* anything, and the manager who stops them working past a budget. The contractor supplies intelligence; the office supplies *memory, action, and control.* An agent is that whole office — not just the contractor. *Where the analogy breaks:* the office (backend) is deterministic and testable; the contractor (LLM) is the single non-deterministic part — which is exactly why you make everything *around* it as rigorous as possible.
+
+## The dependency map (the core diagram of the week)
+
+Every arrow is a place the agentic layer *reaches into* the backend layer:
+
+```
+        AGENTIC LAYER (Part 2)                 BACKEND LAYER (Part 1)
+   ┌──────────────────────────────┐      ┌────────────────────────────────┐
+   │  agent loop (Model 2)         │      │  reproducible env  (uv, lock)  │
+   │    │ needs state persisted ───┼─────►│  stores conversation history   │
+   │    │ needs a tool executed ───┼─────►│  runs the tool = an API call   │
+   │    │ needs validated I/O   ───┼─────►│  Pydantic validates boundaries │
+   │    │ needs a stop guard    ───┼─────►│  budget / max-iter enforcement │
+   │  LLM call (Model 1) ──────────┼──────┤  (the one stateless core)      │
+   └──────────────────────────────┘      └────────────────────────────────┘
+     supplies: reasoning, decisions          supplies: memory, action, control
+```
+
+Read it as four dependencies, each traceable to a concept you already have:
+
+1. **Memory depends on persistence.** Because the LLM is stateless (Model 1), conversation "memory" is just history the backend re-sends each turn — data the backend must store and reload reliably.
+2. **Action depends on the backend executing tools.** The model only *requests* a tool (Model 2); the backend runs it. A tool *is an API call*, so every backend virtue (typed inputs, correct semantics, structured errors) becomes an agent virtue.
+3. **Correctness depends on validated boundaries.** Tool inputs/outputs flow into the loop's state; if they are malformed, the next LLM call reasons over garbage. Pydantic validation from Part 1 belongs *inside* the loop.
+4. **Safety/cost depends on backend control.** Stop conditions, budgets, and iteration caps are ordinary backend logic — the model cannot be trusted to stop itself.
+
+## Under the hood — how a single turn crosses the boundary **[CORE]**
+
+Trace one iteration and watch control pass back and forth between the two Parts:
+
+```
+1. [BACKEND]  load history from store         ← Part 1 (persistence + reproducible env)
+2. [BACKEND]  assemble full prompt             ← Part 1 (Model 1 says: resend everything)
+3. [LLM]      reason → "call tool T(args)"      ← Part 2 (stateless core)
+4. [BACKEND]  validate args (Pydantic)          ← Part 1 (typed boundary)
+5. [BACKEND]  execute T = an API call           ← Part 1 (the tool IS backend code)
+6. [BACKEND]  validate result, append to state  ← Part 1
+7. [BACKEND]  check budget / max-iters          ← Part 1 (control)
+8. loop back to step 2, or return               ← Part 2 (loop shape)
+```
+
+Only **one** of eight steps (step 3) is the model. The other seven are Part 1. That ratio *is* the thesis of the week: an agent is mostly backend engineering wrapped around a small non-deterministic core.
+
+## Data flow, runtime & failure modes across the boundary
+
+- **Data flow:** user input → backend state → LLM → tool request → backend executes → result → backend state → LLM … The LLM never touches storage or the network directly; the backend mediates every crossing.
+- **Coupled failure modes:** an unreproducible environment (Part 1 failure) makes an agent bug non-reproducible even though the *model* is deterministic given identical input • an untyped tool boundary (Part 1 failure) surfaces as the model "reasoning badly" when really it was fed malformed data • a missing stop guard (Part 1 failure) shows up as runaway cost (a Part 2 symptom). **The lesson:** many "the agent is dumb" bugs are actually backend bugs in disguise.
+
+## Performance & trade-offs of the coupling
+
+- Because every loop step re-pays for the whole resent history (Model 1) *and* runs through backend validation/persistence (Part 1), the two layers' costs compound. Optimizations therefore also compound: caching a stable prompt prefix (a Part 1 caching idea, later weeks) directly cuts Part 2 token cost.
+- **Trade-off:** pushing more responsibility into the backend (validation, guards, persistence) adds code but is the *only* place reliability can come from — you cannot make the stateless, non-deterministic core more reliable, so you invest in everything around it.
+
+## Interview & practice questions (Part 3)
+
+1. In one sentence, why is backend rigor a prerequisite for reliable agents rather than a nice-to-have?
+2. Given "the agent forgot the user's name," list two *backend* root causes before blaming the model.
+3. Of the eight steps in one agent turn, how many are the model? Why does that ratio matter?
+4. Name the single architectural shape shared by Part 1 and Part 2.
+
+*Practice — Medium:* map each of the four dependency arrows to the specific Part 1 concept it relies on. • *Hard:* an agent double-charges a customer on a retried tool call — locate the failure on the dependency map and name which layer must fix it.
 
 ---
 
 # Cheat Sheet
 
-**Toolchain in one breath:** uv (Python + venv + deps + resolution + lockfile + cache) · Ruff (lint+format, Rust, single-parse) · mypy --strict (types before runtime) · pytest+asyncio (proof) · pyproject.toml (PEP 621, one config) · committed lockfile (reproducibility) · `src/` layout (test the packaged product) · pre-commit + CI (identical commands both places).
+**Part 1 — toolchain in one breath:** uv (Python + venv + deps + resolution + lockfile + cache) · Ruff (lint+format, Rust, single-parse) · mypy --strict (types before runtime) · pytest+asyncio (proof) · pyproject.toml (PEP 621, one config) · committed lockfile (reproducibility) · `src/` layout (test the packaged product) · pre-commit + CI (identical commands both places).
 
-**Two models (verbatim):** (1) `output = LLM(input)` — **stateless**; memory is the backend resending history every turn. (2) **Agent = `while` loop:** perceive → reason → act → repeat until stop; the model *reasons*, the backend *acts, stores state, enforces limits*.
+**Part 2 — two models (verbatim):** (1) `output = LLM(input)` — **stateless**; memory is the backend resending history every turn. (2) **Agent = `while` loop:** perceive → reason → act → repeat until stop; the model *reasons*, the backend *acts, stores state, enforces limits*.
 
-**Bridge:** LLM stateless ⇒ all state/memory/durability is the backend's job ⇒ backend rigor is the prerequisite.
+**Part 3 — the bridge:** LLM stateless ⇒ all state/memory/durability/control is the backend's job ⇒ an agent is mostly backend engineering around a small non-deterministic core ⇒ backend rigor is the prerequisite. Shared shape: *a stateful backend around a stateless core.*
 
-**Mnemonics:** "**S**tateless" → the backend **S**ends history • "**PRAR**" → Perceive, Reason, Act, Repeat • "Intent vs. Reality" → `pyproject.toml` (ranges) vs. lockfile (exact pins) • "At rest vs. at runtime" → mypy vs. Pydantic.
+**Mnemonics:** "**S**tateless" → the backend **S**ends history • "**PRAR**" → Perceive, Reason, Act, Repeat • "Intent vs. Reality" → `pyproject.toml` (ranges) vs. lockfile (exact pins) • "At rest vs. at runtime" → mypy vs. Pydantic • "1 of 8" → only one step of an agent turn is the model.
 
 ---
 
 # Build This
 
-**Definition of done — a skeleton repo that goes fully green:**
-1. `uv init --package`, `uv python pin 3.13`, add the deps and dev tools from Part A. Commit `uv.lock`.
+**Definition of done — a skeleton repo that goes fully green *and* demonstrates the bridge:**
+1. `uv init --package`, `uv python pin 3.13`, add the deps and dev tools from Part 1. Commit `uv.lock`.
 2. Add the FastAPI `/hello` endpoint and the async test above.
 3. Wire the pre-commit hook and CI stub. Confirm **all four pass**: `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy --strict src`, `uv run pytest`.
-4. **Prove reproducibility:** delete `.venv/`, run `uv sync`, and confirm the tests still pass.
-5. **Prove statelessness (Part B):** write a ~30-line script that keeps a `messages` list, calls any LLM API twice, and shows that *omitting* the history makes it "forget" your name while *including* it makes it remember. You have now implemented "memory" by hand.
-
-*Stretch:* turn the script into a minimal ReAct loop with one tool (a calculator), a `MAX_ITERS` guard, and history appended each turn.
+4. **Prove reproducibility (Part 1):** delete `.venv/`, run `uv sync`, confirm the tests still pass.
+5. **Prove statelessness (Part 2):** write a ~30-line script that keeps a `messages` list, calls any LLM API twice, and shows that *omitting* the history makes it "forget" your name while *including* it makes it remember. You have now implemented "memory" by hand.
+6. **Prove the bridge (Part 3):** turn the script into a minimal ReAct loop with one tool (a calculator), a `MAX_ITERS` guard, and history appended each turn — with the tool's input validated by Pydantic. Deliberately feed the tool a malformed arg and watch the *backend* (not the model) catch it. You have now seen all four dependency arrows fire.
 
 ---
 
 # Active Recall & Self-Test
 
 **Answer from memory (no looking):**
-1. What exactly does a lockfile record that `pyproject.toml` doesn't, and why commit it?
-2. Why is Ruff fast — name the two independent reasons.
-3. Where does mypy stop and Pydantic start?
-4. Write `output = LLM(input)` and explain why "stateless" makes conversation memory the backend's job.
-5. List the four phases of the agent loop and two stop conditions. Who executes the tool?
+1. What exactly does a lockfile record that `pyproject.toml` doesn't, and why commit it? *(Part 1)*
+2. Why is Ruff fast — name the two independent reasons. *(Part 1)*
+3. Where does mypy stop and Pydantic start? *(Part 1)*
+4. Write `output = LLM(input)` and explain why "stateless" makes conversation memory the backend's job. *(Part 2)*
+5. List the four phases of the agent loop and two stop conditions. Who executes the tool? *(Part 2)*
+6. Draw the dependency map: name the four things the agentic layer needs from the backend layer. *(Part 3)*
 
-**Teach-back (60 seconds, aloud):** explain the Bridge — *why does an LLM being stateless make backend rigor a prerequisite for reliable agents?* If you stumble, re-read THE BRIDGE and try again.
+**Teach-back (60 seconds, aloud):** explain the Bridge — *why does an LLM being stateless make backend rigor a prerequisite for reliable agents?* If you stumble, re-read Part 3 and try again.
 
 ---
 
@@ -382,20 +488,17 @@ Because the LLM is stateless (Model 1) and the agent loops (Model 2), **every du
 
 # Key Takeaways & Summary
 
-- Reproducibility is *engineered*, not hoped for: committed lockfile + pinned Python + `uv sync`.
-- Fast tools get used; slow tools get skipped — Rust tooling makes rigor cheap.
-- Correctness has two layers: mypy (code, at rest) + Pydantic (data, at runtime).
-- The LLM is a pure, stateless function; memory is something *you* construct.
-- An agent is just a loop around it; the backend acts, stores state, and enforces limits.
-- The bridge is the whole point: a rigorous backend *is* the foundation of a reliable agent.
+- **Part 1:** Reproducibility is *engineered*, not hoped for — committed lockfile + pinned Python + `uv sync`; correctness has two layers (mypy at rest, Pydantic at runtime); fast tools get used, slow tools get skipped.
+- **Part 2:** The LLM is a pure, stateless function; memory is something *you* construct; an agent is just a loop where the model reasons and the backend acts, stores state, and enforces limits.
+- **Part 3:** The two layers are one system — a stateful backend around a stateless core. Only one of eight steps in an agent turn is the model; the rest is backend engineering. Therefore a rigorous backend *is* the substrate of a reliable agent.
 
-**10-second:** Set up a fast, reproducible Python project, and understand that an LLM has no memory while an agent is a loop that adds memory and tools around it.
+**10-second:** Set up a fast, reproducible Python project (Part 1), understand that an LLM has no memory and an agent is a loop that adds memory and tools around it (Part 2), and see that the loop *runs on* the backend (Part 3).
 
-**1-minute:** Part A builds a reusable skeleton — uv manages Python/packages/resolution and a committed lockfile for identical environments; Ruff lints+formats in one Rust pass; mypy --strict catches type bugs before runtime; pytest proves behavior; `pyproject.toml` is the one config; `src/` layout tests the packaged product; pre-commit + CI run the same checks everywhere. Part B fixes the model: `output = LLM(input)` is stateless, so "memory" is the backend resending history; an agent is a while loop — perceive, reason, act, repeat — where the model reasons and the backend executes tools and enforces limits.
+**1-minute:** Part 1 builds a reusable skeleton — uv manages Python/packages/resolution and a committed lockfile for identical environments; Ruff lints+formats in one Rust pass; mypy --strict catches type bugs before runtime; pytest proves behavior; `pyproject.toml` is the one config; `src/` layout tests the packaged product; pre-commit + CI run the same checks everywhere. Part 2 fixes the model: `output = LLM(input)` is stateless, so "memory" is the backend resending history; an agent is a while loop — perceive, reason, act, repeat — where the model reasons and the backend executes tools and enforces limits. Part 3 connects them: memory, action, correctness, and control are all backend jobs the agent loop depends on, so backend rigor caps agent reliability.
 
-**5-minute:** read Part A "Under the hood" + Part B both models + The Bridge, in order.
+**5-minute:** read Part 1 "Under the hood" + Part 2 both models + Part 3 dependency map and the single-turn trace, in order.
 
-**Expert summary:** both Parts share one architecture — a stateful backend around a stateless core. The toolchain makes that backend reproducible, fast to check, and validated at its boundaries; the mental models locate all durability inside it. Therefore backend rigor isn't adjacent to agent reliability — it *is* the substrate of it.
+**Expert summary:** both layers share one architecture — a stateful backend around a stateless core. The toolchain makes that backend reproducible, fast to check, and validated at its boundaries; the mental models locate all durability inside it; the bridge shows the agent loop is seven parts backend to one part model. Backend rigor isn't adjacent to agent reliability — it *is* the substrate of it.
 
 ---
 

@@ -800,28 +800,35 @@ If any criterion is not met, continue expanding (or trimming, for bloat) until i
 
 # OUTPUT FORMAT
 
-**Organize by Parts, not by one rigid global checklist.** A single flat 1-to-N section list forces unrelated sub-topics to be interleaved and makes the notes tiring to learn from. Instead, structure every note the way a great lecturer structures a course: split the topic into its natural **major sub-topics**, make each one a **Part**, and take each Part *from scratch to mastery on its own* before moving to the next. Then close with shared wrap-up sections that tie the Parts together.
+**Organize by Parts, not by one rigid global checklist.** A single flat 1-to-N section list forces unrelated sub-topics to be interleaved and makes the notes tiring to learn from — backend material bleeding into agentic material and back is exactly the mess this structure exists to prevent. Instead, structure every note the way a great lecturer structures a course: keep each domain in its own **Part**, take that Part *from scratch to mastery on its own* before moving to the next, and only then show how the domains connect.
+
+**Mandatory three-Part structure.** Every note MUST use exactly these three Parts, in this order — do not merge, reorder, split, or rename them:
+
+* **PART 1 — BACKEND** — all backend/systems-engineering topics for the note (APIs, servers, databases, networking, auth, deployment, data flow, infrastructure, etc.). Nothing agentic goes here.
+* **PART 2 — AGENTIC AI** — all agentic-AI topics for the note (LLMs, agents, tools/function calling, memory, planning, RAG, orchestration, multi-agent systems, evaluation, etc.). Nothing backend-specific goes here — assume backend as a black box and cross-reference Part 1 instead of re-explaining it.
+* **PART 3 — THE BRIDGE (how they depend on and interlink)** — the combined Part. This is where the two earlier Parts stop being isolated and become one system: how the agentic layer *depends on* the backend layer and vice versa, where they hand off data, and how they fail together. Do NOT introduce brand-new standalone backend or agentic concepts here — everything in Part 3 must reference concepts already taught in Parts 1 and 2.
+
+Keep each concept in the single Part where it belongs. If a topic feels like it lives in both, teach it once in its home Part and cross-reference it from the other; the *interaction* between the two goes in Part 3, not the concept itself.
 
 ## Overall document shape
 
 ```
 # <Topic Title>
-> Short framing note: what this covers, who it's for, and the ONE idea that unites the Parts.
+> Short framing note: what this covers, who it's for, and the ONE idea that unites the backend and agentic layers.
 
-# PART A — <first major sub-topic>
+# PART 1 — BACKEND
    (runs through the per-Part flow below)
 
-# PART B — <second major sub-topic>
-   (runs through the per-Part flow below)
+# PART 2 — AGENTIC AI
+   (runs through the per-Part flow below; treats backend as a black box, cross-referencing Part 1)
 
-# PART C … (as many Parts as the topic naturally has — often 1-4)
+# PART 3 — THE BRIDGE (how backend and agentic layers depend on and interlink with each other)
+   (runs through the per-Part flow below, but every concept references Part 1 or Part 2)
 
-# THE BRIDGE — how the Parts connect into one coherent mental model
 # <Topic-wide wrap-up sections>
 ```
 
-* Choose Parts by **natural conceptual boundaries** (e.g. "the Python toolchain" vs. "the two mental models"), not arbitrarily. A small topic may be a single Part; that's fine — don't invent Parts.
-* If the Parts share a unifying insight, state it in the opening framing note and again in an explicit **Bridge** section near the end. The Bridge is where isolated facts become one mental model (see KNOWLEDGE CONNECTIONS).
+* State the ONE unifying insight (how the backend and agentic layers form a single system) in the opening framing note, and pay it off in Part 3. Part 3 is where isolated facts become one mental model (see KNOWLEDGE CONNECTIONS): draw the explicit dependency map — what the agent calls into, what the backend serves back, and what breaks on each side when the other misbehaves.
 
 ## The per-Part flow (each Part moves through this progression)
 
@@ -839,15 +846,15 @@ Within each Part, take the reader from zero to deep understanding using the TEAC
 
 Tag each concept's depth tier (Rule 6) as you go.
 
-## Topic-wide wrap-up (once, at the end, covering all Parts)
+## Topic-wide wrap-up (once, at the end, after Part 3, covering all three Parts)
 
-* **The Bridge** — how the Parts fit into one coherent model
-* **Cheat Sheet** — the whole topic in one glance
+Note: the backend↔agentic connection is **Part 3 (The Bridge)** above — do not repeat it here. The wrap-up is the shared closing material for the whole note:
+
+* **Cheat Sheet** — the whole topic (all three Parts) in one glance
 * **Build This** — a hands-on task with a runnable "definition of done" that exercises the concepts in real code
 * **Active Recall & Self-Test** — questions answered from memory, plus a 60-second "explain it aloud" teach-back prompt
 * **Primary Sources** — official docs / PEPs / RFCs / papers / source code to verify against and go deeper
 * **Key Takeaways & Summary** — including the 10-second / 1-minute / 5-minute / expert-level explanations (see MEMORY RETENTION)
-* **Suggested Next Topics**
 
 The complete set of MEMORY RETENTION elements and every QUALITY CHECKLIST criterion must still be satisfied across the note as a whole — the Part structure is *how* they're organized, not permission to skip any of them.
 
