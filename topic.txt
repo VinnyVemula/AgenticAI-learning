@@ -1,0 +1,18 @@
+PHASE 0 — Environment & Mental Models (Week 1)
+
+Before anything else, get the modern toolchain and the two foundational mental models in place.
+
+Week 1 — Setup + the two mental models
+
+
+Backend track: Install and adopt the modern Python toolchain — uv (package/env/version management), Ruff (lint+format), a type checker (mypy strict), pytest + pytest-asyncio. Set up a pyproject.toml (PEP 621), src/ layout, committed lockfile, pinned Python version. This is your standard project skeleton for everything that follows.
+Agentic track: Get the two foundational mental models straight, on paper, before touching a framework:
+
+An LLM call is a stateless input→output function. It has no memory. "Memory" and "conversation" are illusions your backend constructs by re-sending prior messages every turn.
+An agent is a while loop around that function: perceive (read state/tool results) → reason (decide next action) → act (call a tool or answer) → repeat until a stop condition. Everything else in this plan is variations on how that loop is structured, who runs it, and how state persists between iterations.
+
+
+
+Bridge: Both tracks start from the same realization — the LLM is stateless, so all durability, state, and memory are backend responsibilities. This is why backend rigor is the prerequisite, not a nice-to-have.
+Under the hood: How uv resolves and locks dependencies (a resolver producing a locked graph, not sequential pip installs). How Ruff runs 800+ rules in milliseconds (Rust, single-pass AST). Why type checking catches real bugs (Pydantic + strict typing = validated boundaries).
+Build: A project skeleton repo you'll reuse every week — uv-managed, Ruff+mypy+pytest wired into a pre-commit hook and a CI stub. Add a trivial FastAPI "hello" endpoint and one passing async test.
