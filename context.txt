@@ -133,6 +133,22 @@ Depth is not word count. State each idea once, in the section where it belongs, 
 
 ---
 
+## Rule 10 — STRICT: every sub-topic runs the teaching ladder and carries a concrete worked example
+
+This is a hard, non-negotiable rule, not a stylistic preference. Terse bullet lists that merely *name* facts are forbidden as the primary explanation — they read as shallow and fail the reader. **Every named concept or sub-topic** (each `[CORE]`/`[WORKING]`/`[AWARE]` item, each numbered sub-section within a Part) MUST be developed through this ladder, in this spirit, before moving on:
+
+1. **Intuition** — the plain-language "why this exists / what problem it solves," in prose, before any jargon.
+2. **Analogy** — at least one everyday analogy, AND an explicit "where the analogy breaks" note.
+3. **A concrete WORKED example** — this is the load-bearing requirement. Not a vague mention ("e.g. a database") but a *specific, traced example with real content*: actual numbers, a short code snippet, a real JSON payload, a step-by-step timeline with values, or a before/after comparison. The reader must be able to follow the mechanism happening on concrete inputs. Label it clearly (e.g. a "**Worked example**" or "**Example**" block).
+4. **Visual** — an ASCII/Markdown diagram, table, or trace where it aids understanding.
+5. **Under-the-hood / formal truth** — the precise mechanism, especially for `[CORE]` concepts (open the black box per Rule 6's tier).
+
+Calibration by tier still applies (Rule 6): `[CORE]` gets the full ladder to the metal; `[WORKING]` gets intuition + analogy + a worked example + the interface (internals named, not opened); `[AWARE]` gets at least intuition + one concrete example, then stops. **But the worked example in step 3 is mandatory at ALL three tiers** — there is no concept too small for one concrete example.
+
+The bar to meet, verbatim, is the Phase 1 study notes in this project (`notes/phase1-week*.md`): every sub-topic there has an intuition-first opening, a developed analogy, and a clearly-labeled worked example with real numbers/code/payloads/timelines. Match that density. If a section states a fact without showing it happening on a concrete input, the section is incomplete — expand it until it does.
+
+---
+
 # DEPTH REQUIREMENT (CALIBRATED)
 
 Do not stop at surface explanations — but do **not** treat every concept with equal depth. Uniform maximum depth buries what matters and produces notes no one re-reads. Expert engineers calibrate: they go to the metal on what is load-bearing and knowingly treat the rest as a trusted black box.
@@ -766,9 +782,11 @@ Before finalizing each section, verify:
 
 ✓ Every black box has been opened.
 
-✓ At least one analogy is provided.
+✓ At least one analogy is provided (with an explicit "where it breaks" note).
 
 ✓ At least one visual diagram is included.
+
+✓ **STRICT (Rule 10): EVERY sub-topic has a concrete, clearly-labeled WORKED example** — real numbers, code, JSON payloads, or a step-by-step traced timeline showing the mechanism on concrete inputs — not merely a named fact or a vague mention. No sub-topic may be explained by a bare bullet list alone. Match the density of `notes/phase1-week*.md`.
 
 ✓ At least one real-world example is included.
 
