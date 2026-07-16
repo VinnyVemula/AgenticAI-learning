@@ -77,6 +77,63 @@ DANGEROUS ordering:            SAFE ordering:
 
 This is *why* idempotency keys pair with a durable store and, later, the **outbox pattern** (Phase 3). Give keys a **TTL** (time to live) long enough to cover realistic retry windows (hours) so the store doesn't grow forever. And the key is **client-generated** — only the client knows that two physical requests are "the same logical operation."
 
+### Runnable example — the four-case idempotency contract (FastAPI)
+
+```python
+# app.py — run with:  uvicorn app:app --reload
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+charges: list[dict] = []
+# idempotency store: key -> {"state": "in_flight" | "done", "response": dict | None}
+idem: dict[str, dict] = {}
+
+
+class ChargeIn(BaseModel):
+    amount: int
+
+
+@app.post("/charge")
+def charge(body: ChargeIn, idempotency_key: str | None = Header(default=None)):
+    if idempotency_key is None:
+        raise HTTPException(400, "Idempotency-Key header required")
+
+    record = idem.get(idempotency_key)
+    if record is not None:                          # CASE: key EXISTS
+        if record["state"] == "in_flight":          #   a retry arrived mid-flight
+            raise HTTPException(409, "request already in progress")   # 409
+        return record["response"]                   #   completed -> REPLAY, don't re-charge
+
+    idem[idempotency_key] = {"state": "in_flight", "response": None}  # reserve BEFORE the effect
+    charge_id = len(charges) + 1                     # the side effect
+    charges.append({"id": charge_id, "amount": body.amount})
+    response = {"charge_id": charge_id, "total_charges": len(charges)}
+    idem[idempotency_key] = {"state": "done", "response": response}   # store {key -> response}
+    return response
+```
+
+```bash
+KEY=$(python -c "import uuid; print(uuid.uuid4())")
+
+# 1st call with this key: NEW -> charges
+curl -s -X POST localhost:8000/charge -H 'content-type: application/json' \
+  -H "Idempotency-Key: $KEY" -d '{"amount":10}'
+# -> {"charge_id":1,"total_charges":1}
+
+# retry with the SAME key: EXISTS + done -> replays the stored response, no 2nd charge
+curl -s -X POST localhost:8000/charge -H 'content-type: application/json' \
+  -H "Idempotency-Key: $KEY" -d '{"amount":10}'
+# -> {"charge_id":1,"total_charges":1}   ← identical; still only ONE charge
+
+# a NEW key is a NEW logical operation -> charges again
+curl -s -X POST localhost:8000/charge -H 'content-type: application/json' \
+  -H "Idempotency-Key: $(python -c 'import uuid;print(uuid.uuid4())')" -d '{"amount":10}'
+# -> {"charge_id":2,"total_charges":2}
+```
+
+**Mapping code to the four-case contract.** The `record is not None` branch handles the two "EXISTS" cases: `in_flight` → `409` (a retry landed while the first request is still running), `done` → replay the stored response verbatim. The `else` path is the "NEW" case: **reserve the key `in_flight` *before* touching `charges`**, do the side effect, then store the response. That reserve-first ordering is the atomicity point above — if you stored the key *after* charging and crashed in between, a retry would see no key and charge again. Note the honest limitation of this demo: an in-memory dict with three separate statements isn't truly atomic. Production replaces it with a single DB transaction (charge + key-write commit together) or an atomic `SETNX` in Redis for the reservation — same contract, real durability.
+
 ---
 
 ## 2. Cursor-based pagination **[WORKING]**
@@ -107,6 +164,56 @@ Page 2: after=cursor(C)  → [D, E, F]   ← no skip, no dupe: it resumes AFTER 
 
 Prefer cursors for anything that mutates; offset is acceptable only for small static datasets or when the user genuinely needs "jump to page N."
 
+### Runnable example — cursor pagination that survives an insert (FastAPI)
+
+```python
+import base64
+from fastapi import FastAPI
+
+app = FastAPI()
+# A "table" sorted by id. Pretend this is Postgres.
+items = [{"id": i, "name": chr(64 + i)} for i in range(1, 6)]   # A(1) .. E(5)
+
+
+def encode_cursor(last_id: int) -> str:                  # opaque pointer = last id seen
+    return base64.urlsafe_b64encode(str(last_id).encode()).decode()
+
+
+def decode_cursor(cur: str) -> int:
+    return int(base64.urlsafe_b64decode(cur.encode()).decode())
+
+
+@app.get("/items")
+def list_items(after: str | None = None, limit: int = 2):
+    start_id = decode_cursor(after) if after else 0
+    rows = sorted(items, key=lambda r: r["id"])
+    page = [r for r in rows if r["id"] > start_id][:limit]     # anchor on VALUE, not count
+    next_cursor = encode_cursor(page[-1]["id"]) if page else None
+    return {"items": page, "next": next_cursor}
+
+
+# demo-only: insert a row so you can prove the cursor is stable
+@app.post("/items")
+def add_item(name: str):
+    items.append({"id": max(r["id"] for r in items) + 1, "name": name})
+    return {"count": len(items)}
+```
+
+```bash
+# Page 1 — no cursor yet
+curl -s 'localhost:8000/items?limit=2'
+# -> {"items":[{"id":1,"name":"A"},{"id":2,"name":"B"}],"next":"Mg=="}   (Mg== = base64 "2")
+
+# Someone inserts a new row WHILE you page
+curl -s -X POST 'localhost:8000/items?name=Z'   # -> {"count":6}
+
+# Page 2 — resume AFTER id 2. The insert doesn't shift the window.
+curl -s 'localhost:8000/items?after=Mg==&limit=2'
+# -> {"items":[{"id":3,"name":"C"},{"id":4,"name":"D"}],"next":"NA=="}   ← no skip, no dupe
+```
+
+**Why the cursor is immune to the insert.** Offset pagination would say "skip 2 rows"; if a row appears before the ones you've seen, "skip 2" now lands on a different row and you get a duplicate or a gap. The cursor instead encodes a **position by value** — the last `id` you saw (`2`) — and page 2 asks for `id > 2`. Adding row `Z` (which gets `id 6`) can't change which rows have `id > 2` in the already-consumed range, so the window is stable no matter what's inserted or deleted elsewhere. The cursor is base64-encoded purely so callers treat it as opaque and don't hand-craft it; decode it and it's just the anchor value.
+
 ---
 
 ## 3. Consistent error format **[WORKING]**
@@ -124,6 +231,54 @@ Every consumer needs to parse errors the same way. Adopt **RFC 9457 "Problem Det
 
 **Why it matters (worked):** without a standard shape, one endpoint returns `{"error":"x"}`, another `{"message":"y"}`, another `{"errors":[...]}` — and every consumer writes bespoke parsing that breaks on the next endpoint. One envelope everywhere = one parser everywhere.
 
+### Runnable example — one RFC 9457 envelope for every error (FastAPI)
+
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+
+class Problem(Exception):
+    """Raise this anywhere; the handler renders it as RFC 9457 Problem Details."""
+    def __init__(self, status, type_, title, detail, instance):
+        self.body = {"type": type_, "title": title, "status": status,
+                     "detail": detail, "instance": instance}
+
+
+@app.exception_handler(Problem)
+async def problem_handler(request: Request, exc: Problem):
+    return JSONResponse(
+        status_code=exc.body["status"],
+        content=exc.body,
+        media_type="application/problem+json",   # the standard content type
+    )
+
+
+@app.post("/charges")
+def create_charge():
+    raise Problem(
+        status=402,
+        type_="https://api.example.com/errors/insufficient-funds",
+        title="Insufficient funds",
+        detail="Your balance is $3, this charge is $10.",
+        instance="/charges/abc123",
+    )
+```
+
+```bash
+curl -s -i -X POST localhost:8000/charges | grep -E 'HTTP|content-type'
+# -> HTTP/1.1 402 Payment Required
+# -> content-type: application/problem+json
+
+curl -s -X POST localhost:8000/charges
+# -> {"type":"https://api.example.com/errors/insufficient-funds","title":"Insufficient funds",
+#     "status":402,"detail":"Your balance is $3, this charge is $10.","instance":"/charges/abc123"}
+```
+
+**What makes this reusable.** Every error in the whole service is raised as a `Problem` and rendered by the single handler, so consumers get one shape everywhere and the `application/problem+json` content type tells them it's a standard error body. The load-bearing field is `type`: it's a **stable URI identifying the error class**, so clients branch on `type == ".../insufficient-funds"` rather than on the human `title` (which you're free to reword or translate without breaking anyone). `status` mirrors the HTTP code, `detail` describes *this* occurrence, `instance` names the specific resource.
+
 ---
 
 ## 4. Versioning **[WORKING]**
@@ -140,6 +295,42 @@ BREAKING:            change `amount` from string "10" to number 10  → old clie
 BREAKING:            remove a field                                  → old clients get nothing
 ```
 Breaking changes require a new version so old clients keep hitting `/v1`. Cheap to plan now, brutally expensive to retrofit onto live consumers.
+
+### Runnable example — URL versioning containing a breaking change (FastAPI)
+
+```python
+from fastapi import APIRouter, FastAPI
+
+app = FastAPI()
+v1 = APIRouter(prefix="/v1")
+v2 = APIRouter(prefix="/v2")
+
+
+@v1.get("/orders/{oid}")
+def get_order_v1(oid: str):
+    return {"id": oid, "user_name": "Vinay"}                 # original contract
+
+
+@v2.get("/orders/{oid}")
+def get_order_v2(oid: str):
+    # `user_name` -> `username` is BREAKING, so it lives behind /v2.
+    # `currency` is ADDITIVE — safe, old v1 clients simply never see it.
+    return {"id": oid, "username": "Vinay", "currency": "USD"}
+
+
+app.include_router(v1)
+app.include_router(v2)
+```
+
+```bash
+curl -s localhost:8000/v1/orders/o1
+# -> {"id":"o1","user_name":"Vinay"}          ← existing clients keep working, untouched
+
+curl -s localhost:8000/v2/orders/o1
+# -> {"id":"o1","username":"Vinay","currency":"USD"}
+```
+
+**How versioning contains the blast radius.** A client that wrote `resp["user_name"]` would get a `KeyError` the instant you renamed the field — so the rename can't happen *in place*. Putting the new shape behind `/v2` lets old clients keep hitting `/v1` with the exact contract they were built against, while new clients opt into `/v2` on their own schedule. Additive changes (the `currency` field) don't need a new version at all: a well-behaved client ignores fields it doesn't recognize, so adding one is safe even on `/v1`. The discipline is deciding *up front* which bucket every change falls into — additive (ship it) vs. rename/remove/retype (new version) — because retrofitting versioning after clients are live is the expensive path.
 
 ---
 
@@ -191,6 +382,49 @@ With CoT ("think step by step"):
 
 The intermediate tokens (`80 × 0.75 = 60 …`) *are* the arithmetic being carried out. This is why "think step by step" isn't a trick — it's buying the model more forward passes. Hold onto this; it explains CoT, ReAct, and why "reasoning" models emit long thought traces.
 
+### Runnable example — denying vs. granting the scratchpad (Anthropic SDK)
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()
+
+# Answer-immediately: forbid intermediate tokens (no scratchpad)
+fast = client.messages.create(
+    model="claude-opus-4-8", max_tokens=20,
+    messages=[{"role": "user", "content":
+        "A shirt costs $80, discounted 25%, then taxed 10%. "
+        "Reply with ONLY the final number, no working."}],
+)
+
+# Chain-of-thought: let it emit the steps first (grant the scratchpad)
+cot = client.messages.create(
+    model="claude-opus-4-8", max_tokens=300,
+    messages=[{"role": "user", "content":
+        "A shirt costs $80, discounted 25%, then taxed 10%. "
+        "Think step by step, then give the final price."}],
+)
+
+print("fast:", fast.content[0].text)
+print("cot :", "\n".join(b.text for b in cot.content if b.type == "text"))
+```
+
+**What the two calls demonstrate.** The only difference is whether the prompt *allows intermediate tokens*. In the CoT call the model writes `80 × 0.75 = 60`, `60 × 1.10 = 66` — and those emitted tokens are literally the computation reaching the answer. In the "only the number" call you've removed the scratchpad, so it must produce the answer in a single forward pass. (Honest caveat: `claude-opus-4-8` is strong enough to often get this particular arithmetic right even in fast mode — the *mechanism* is what matters, and it's exactly why "reasoning" models exist.) This connects to a current-Claude feature: **adaptive thinking** (`thinking={"type": "adaptive"}`) is CoT that the model does in dedicated *thinking* tokens before its visible answer — the same "tokens are the computation" idea, just in a separate channel you don't have to prompt for:
+
+```python
+resp = client.messages.create(
+    model="claude-opus-4-8", max_tokens=1024,
+    thinking={"type": "adaptive", "display": "summarized"},   # model decides how much to think
+    messages=[{"role": "user", "content":
+        "A shirt costs $80, discounted 25%, then taxed 10%. Final price?"}],
+)
+for b in resp.content:
+    if b.type == "thinking":
+        print("[thinking]", b.thinking)     # the scratchpad, surfaced
+    elif b.type == "text":
+        print("[answer]", b.text)
+```
+
 ## The strategies **[CORE for CoT/ReAct; WORKING otherwise]**
 
 ### Chain-of-Thought (CoT) **[CORE]**
@@ -227,6 +461,41 @@ Sample the answer *N* times at higher temperature and take the **majority vote**
 Ask the same hard question 5×:  [66, 66, 70, 66, 66]  → majority "66" → answer 66
 ```
 *Why it works:* independent reasoning paths that converge on the same answer are more likely correct. *When:* problems with a single verifiable answer. *Cost:* N× calls.
+
+### Runnable example — sample N, take the majority vote (Anthropic SDK)
+
+```python
+import anthropic, collections
+
+client = anthropic.Anthropic()
+
+Q = ("A juggler has 16 balls. Half are golf balls, and half of the golf balls "
+     "are blue. How many blue golf balls are there? Reply with ONLY the number.")
+
+
+def sample_once() -> str:
+    r = client.messages.create(
+        model="claude-opus-4-8", max_tokens=10,
+        messages=[{"role": "user", "content": Q}],
+    )
+    return r.content[0].text.strip()
+
+
+answers = [sample_once() for _ in range(5)]            # 5 INDEPENDENT samples
+winner, count = collections.Counter(answers).most_common(1)[0]
+print(answers, "->", f"{winner} ({count}/5)")
+# e.g. ['4', '4', '4', '4', '4'] -> 4 (5/5)
+```
+
+**Reality check on temperature (current Claude).** The theory box below says to *raise the temperature* for the N samples so the paths diverge. On current Claude models (`claude-opus-4-8`, `claude-opus-4-7`, `claude-fable-5`) that knob has been **removed** — passing it is a hard error:
+
+```python
+client.messages.create(model="claude-opus-4-8", max_tokens=10, temperature=0.7,
+                       messages=[{"role": "user", "content": "hi"}])
+# raises anthropic.BadRequestError: temperature is not supported on this model
+```
+
+So on current Claude you don't set temperature at all — each `messages.create` call already samples independently, giving you the variety self-consistency needs for free, and you steer determinism-vs-diversity through **prompting** and the **`effort`** setting instead. The "raise temperature" advice still applies verbatim to providers/older models that expose the parameter; the *strategy* (sample N, majority-vote) is unchanged either way. The cost point stands regardless: this ran the model 5× for one answer.
 
 ### Temperature & sampling **[WORKING]**
 **Temperature** scales the randomness of token sampling.
@@ -337,6 +606,70 @@ Because Part 1's idempotency layer makes a side-effecting tool safe to repeat, y
 4. [YOU]   same derived key → store HIT → return the SAME booking #55        (Part 1)
 5. [MODEL] sees success once; no duplicate flight                           (Part 2)
 ```
+
+### Runnable example — a retry-safe `book_flight` in a real ReAct loop (Anthropic SDK)
+
+```python
+import anthropic, json, hashlib
+
+client = anthropic.Anthropic()
+
+bookings: dict[str, dict] = {}          # idempotency store: key -> booking
+seq = {"n": 0}
+
+
+def idem_key(user: str, flight: str, date: str) -> str:
+    # Derive the key from the LOGICAL action, not from a random request id.
+    return hashlib.sha256(f"{user}|{flight}|{date}".encode()).hexdigest()[:12]
+
+
+def book_flight(user: str, flight: str, date: str) -> dict:
+    key = idem_key(user, flight, date)
+    if key in bookings:                             # same logical action -> replay
+        return {**bookings[key], "replayed": True}
+    seq["n"] += 1
+    booking = {"booking_id": seq["n"], "flight": flight, "date": date}
+    bookings[key] = booking
+    return booking
+
+
+TOOLS = [{
+    "name": "book_flight",
+    "description": "Book a flight. Use when the user asks to book a specific flight on a date.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "flight": {"type": "string"},
+            "date": {"type": "string", "description": "YYYY-MM-DD"},
+        },
+        "required": ["flight", "date"],
+    },
+}]
+
+USER = "u1"
+messages = [{"role": "user", "content": "Book flight BA123 on 2026-08-01."}]
+
+for _ in range(6):                                  # MAX_ITERS guard
+    resp = client.messages.create(model="claude-opus-4-8", max_tokens=1024,
+                                  tools=TOOLS, messages=messages)
+    if resp.stop_reason != "tool_use":
+        print(next(b.text for b in resp.content if b.type == "text"))
+        break
+    messages.append({"role": "assistant", "content": resp.content})
+    results = []
+    for block in resp.content:
+        if block.type == "tool_use":
+            out = book_flight(USER, block.input["flight"], block.input["date"])
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": json.dumps(out)})
+    messages.append({"role": "user", "content": results})
+
+# Now simulate the model RETRYING the same logical action (its result was slow/lost):
+print(book_flight(USER, "BA123", "2026-08-01"))     # -> {... "replayed": True}, SAME booking_id
+print("distinct bookings:", len(bookings))          # -> 1
+```
+
+**Why the retry collapses to one booking.** The key is `hash(user, flight, date)` — derived from *what the action means*, not from a per-request UUID the model would regenerate each time. So when the ReAct loop (or a Reflexion retry, or a `429`-driven retry from [Week 3](phase1-week3.md)) fires `book_flight` a second time with the same arguments, `idem_key(...)` produces the *same* key, the store hits, and you replay booking #1 instead of creating booking #2. Remove the store and the second call would book a second seat and charge the customer twice — the double-charge from Part 1, now triggered by an autonomous, retry-happy caller. This is the whole bridge in code: **the idempotency-key discipline is exactly what makes an agent's constant retries safe**, which is what *lets* you adopt retry-heavy strategies without fear.
 
 ## Coupled failure modes
 

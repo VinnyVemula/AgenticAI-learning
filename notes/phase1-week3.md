@@ -57,6 +57,61 @@ t4  server (no memory of t1) charges the card $10 AGAIN → "200 OK, charge #10"
 
 The client did nothing wrong — retrying after a timeout is *correct* behavior. The bug is that `POST /charge` is not idempotent. This single scenario drives the idempotency-key pattern ([Week 4](phase1-week4.md)) and, in the agent world, safe tool retries (Part 3). Note that a `GET /balance` retried at t3 would be harmless — that's the power of idempotency.
 
+### Runnable example — non-idempotent charge vs. idempotent update (FastAPI)
+
+The double-charge above isn't hypothetical. Here it is as code you can actually run.
+
+```python
+# app.py — run with:  uvicorn app:app --reload
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# Tiny in-memory "databases". In real life these are Postgres/Redis.
+charges: list[dict] = []          # every POST appends one row
+profiles: dict[str, dict] = {}    # keyed by user id
+
+
+class ChargeIn(BaseModel):
+    amount: int
+
+
+@app.post("/charge")                       # NOT idempotent — appends
+def charge(body: ChargeIn):
+    charge_id = len(charges) + 1
+    charges.append({"id": charge_id, "amount": body.amount})
+    return {"charge_id": charge_id, "total_charges": len(charges)}
+
+
+class ProfileIn(BaseModel):
+    display_name: str
+
+
+@app.put("/profile/{user_id}")             # idempotent — assigns
+def set_profile(user_id: str, body: ProfileIn):
+    profiles[user_id] = {"display_name": body.display_name}
+    return {"user_id": user_id, **profiles[user_id]}
+```
+
+Reproduce the failure and the safe case from a second terminal:
+
+```bash
+# POST is NOT idempotent — "retrying" creates a second charge
+curl -s -X POST localhost:8000/charge -H 'content-type: application/json' -d '{"amount":10}'
+# -> {"charge_id":1,"total_charges":1}
+curl -s -X POST localhost:8000/charge -H 'content-type: application/json' -d '{"amount":10}'
+# -> {"charge_id":2,"total_charges":2}   ← the double charge, exactly as in the timeline above
+
+# PUT IS idempotent — "retrying" leaves the same single state
+curl -s -X PUT localhost:8000/profile/u1 -H 'content-type: application/json' -d '{"display_name":"Vinay"}'
+# -> {"user_id":"u1","display_name":"Vinay"}
+curl -s -X PUT localhost:8000/profile/u1 -H 'content-type: application/json' -d '{"display_name":"Vinay"}'
+# -> {"user_id":"u1","display_name":"Vinay"}   ← identical state; twice == once
+```
+
+**Why this proves the point, line by line.** `charges` is a **list**, so `charge()` *appends* on every call — two identical `POST`s leave **two** rows, doubling the effect on the world, which is the literal definition of *not* idempotent. `profiles` is a **dict keyed by `user_id`**, so `set_profile()` *assigns* (`profiles[user_id] = ...`) — two identical `PUT`s overwrite the same key with the same value, leaving **one** row in the same state. The property lives in **what the handler does to state** (append vs. assign), *not* in the verb label: a `POST` handler can be made idempotent (the idempotency-key work in [Week 4](phase1-week4.md)), and a `PUT` handler that appended to a list would *not* be. The verb is a promise to the caller; your handler code is what keeps that promise.
+
 ---
 
 ## 2. The status-code taxonomy — a precise vocabulary **[CORE]**
@@ -104,6 +159,71 @@ Collapsing all three into a generic `400` destroys the caller's ability to react
 
 **The danger example:** you `POST /charge`, the server charges the card, then crashes *before* sending the response → the client sees `500`. If the client "safely retries the 5xx," it **double-charges** — because the operation wasn't idempotent and actually *did* complete. This is the exact reason `5xx` retries on non-idempotent operations require an idempotency key ([Week 4](phase1-week4.md)).
 
+### Runnable example — `POST /users` returning the *correct* code for each failure (FastAPI)
+
+This is the "Build This" endpoint. It returns `400` / `422` / `409` / `201`, each for its precise reason.
+
+```python
+# pip install "fastapi[standard]" "pydantic[email]"
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, EmailStr
+
+app = FastAPI()
+users: dict[str, dict] = {}          # keyed by username
+
+
+class UserIn(BaseModel):
+    username: str
+    email: EmailStr                  # Pydantic checks this is a real email SHAPE
+
+
+@app.post("/users", status_code=201)
+def create_user(body: UserIn):
+    if body.username in users:                              # values fine, but CONFLICT with state
+        raise HTTPException(status_code=409, detail="username already taken")
+    users[body.username] = {"email": body.email}
+    return {"username": body.username, "email": body.email}   # 201 Created
+
+
+# FastAPI's DEFAULT returns 422 even when the body can't be PARSED at all.
+# To honor "400 = can't parse, 422 = parsed but value invalid", we downgrade
+# the specific json_invalid error to 400 and leave every other case as 422.
+@app.exception_handler(RequestValidationError)
+async def on_validation_error(request: Request, exc: RequestValidationError):
+    if any(err["type"] == "json_invalid" for err in exc.errors()):
+        return JSONResponse(status_code=400, content={"error": "malformed JSON"})
+    return JSONResponse(status_code=422,
+                        content={"error": "invalid values", "detail": exc.errors()})
+```
+
+Drive all four outcomes (`-w '%{http_code}'` prints just the status code):
+
+```bash
+# 400 — body is not JSON (missing closing brace) → we can't PARSE it
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/users \
+  -H 'content-type: application/json' -d '{"username":"a","email":"a@b.com"'
+# -> 400
+
+# 422 — parses fine, but the email VALUE is invalid
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/users \
+  -H 'content-type: application/json' -d '{"username":"a","email":"not-an-email"}'
+# -> 422
+
+# 201 — created
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/users \
+  -H 'content-type: application/json' -d '{"username":"vinay","email":"v@x.com"}'
+# -> 201
+
+# 409 — values valid, but username CONFLICTS with current state
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/users \
+  -H 'content-type: application/json' -d '{"username":"vinay","email":"v2@x.com"}'
+# -> 409
+```
+
+**What each mechanism is doing.** The `422` is *free*: FastAPI runs the `UserIn` Pydantic model against the parsed body, and `EmailStr` rejects `"not-an-email"` before your function body ever runs — that's the "I parsed it but the value is wrong" case. The `409` is *yours to raise*: only your code knows the username is already taken (a fact about **current state**, not about the request's shape), so you `raise HTTPException(409, ...)`. The `400` needs the custom handler because FastAPI/Starlette treat an unparseable body as *just another validation error* and would return `422` — but "I couldn't even parse your request" and "I parsed it but a field is wrong" are different instructions to the caller, so we split them by inspecting `err["type"] == "json_invalid"`. This distinction is exactly what Part 3 exploits: when the "caller" is an LLM, a `422` means *fix the argument* and a `409` means *re-read state and retry* — collapsing them into a generic `400` destroys the model's ability to recover.
+
 ---
 
 ## 3. Caching headers **[WORKING]**
@@ -125,6 +245,47 @@ Re-downloading something that hasn't changed wastes bandwidth and time. An **`ET
 
 The `304` saves sending the whole body. `Cache-Control` directives (`max-age=60`, `no-store`, `private`) state who may cache and for how long. Know the interface and when to reach for it; cache *invalidation strategy* is a Phase 2 topic. **[WORKING].**
 
+### Runnable example — `ETag` / `If-None-Match` → `304` (FastAPI)
+
+```python
+import hashlib
+from fastapi import FastAPI, Response, Header
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+profile = {"name": "Vinay", "bio": "backend + agents"}
+
+
+def etag_for(obj: dict) -> str:
+    # A stable fingerprint of the CURRENT content. sorted() so key order
+    # never changes the tag; slice keeps the header short.
+    raw = repr(sorted(obj.items())).encode()
+    return '"' + hashlib.sha256(raw).hexdigest()[:8] + '"'
+
+
+@app.get("/profile")
+def get_profile(if_none_match: str | None = Header(default=None)):
+    current = etag_for(profile)
+    if if_none_match == current:            # client's cached copy is still valid
+        return Response(status_code=304)    # 304 Not Modified — NO body
+    resp = JSONResponse(content=profile)
+    resp.headers["ETag"] = current          # hand the client a tag to send back next time
+    return resp
+```
+
+```bash
+# 1st request: full body + the ETag
+curl -si localhost:8000/profile | grep -E 'HTTP|etag'
+# -> HTTP/1.1 200 OK
+# -> etag: "3f8a1c9d"
+
+# 2nd request: echo the tag back — nothing changed, so no body is sent
+curl -si localhost:8000/profile -H 'If-None-Match: "3f8a1c9d"' | head -1
+# -> HTTP/1.1 304 Not Modified
+```
+
+**How the exchange works.** `etag_for()` derives a version tag from the resource's *content* — change `profile` and the tag changes automatically. FastAPI maps the incoming `If-None-Match` request header onto the `if_none_match` parameter (header names are case-insensitive and dashes become underscores). If the client's tag equals the current one, the content hasn't changed, so we return a bare `304` with **no body** — the client reuses its cached copy and we save the bandwidth of re-sending it. Only when the tag differs do we send the full `200` plus the new `ETag`. This is the same "avoid re-doing work whose inputs didn't change" instinct that prompt caching applies to token prefixes in Phase 2.
+
 ---
 
 ## 4. Content negotiation **[WORKING]**
@@ -138,6 +299,33 @@ GET /report   Accept-Encoding: gzip      → a compressed body
 ```
 
 The server picks and echoes its choice in `Content-Type` / `Content-Encoding`. One resource, many representations, chosen by the caller's stated preference. **[WORKING].**
+
+### Runnable example — one URL, two representations (FastAPI)
+
+```python
+from fastapi import FastAPI, Header
+from fastapi.responses import JSONResponse, HTMLResponse
+
+app = FastAPI()
+report = {"title": "Q3", "revenue": 42}
+
+
+@app.get("/report")
+def get_report(accept: str = Header(default="application/json")):
+    if "text/html" in accept:                       # caller asked for a page
+        return HTMLResponse(f"<h1>{report['title']}</h1><p>Revenue: {report['revenue']}</p>")
+    return JSONResponse(report)                      # default representation
+```
+
+```bash
+curl -s localhost:8000/report -H 'Accept: application/json'
+# -> {"title":"Q3","revenue":42}
+
+curl -s localhost:8000/report -H 'Accept: text/html'
+# -> <h1>Q3</h1><p>Revenue: 42</p>
+```
+
+**The point.** Same path `/report`, same underlying `report` data — the `Accept` header alone selects which representation the caller gets, and the response's `Content-Type` (set automatically by `JSONResponse` vs. `HTMLResponse`) echoes the choice back. This is one resource with many faces, negotiated by the client's stated preference rather than by inventing separate `/report.json` and `/report.html` URLs.
 
 ---
 
@@ -215,6 +403,52 @@ Rich:   "description": "Get current weather for a city. Use for ANY question abo
 
 Same tool, same code — the description alone changed whether the agent worked. **Tool descriptions are prompt engineering.**
 
+### Runnable example — sending a tool and watching the model emit a tool-call (Anthropic SDK)
+
+The examples below use Claude (the model this course is built around). Install and set your key first:
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+```python
+import anthropic
+
+client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from the environment
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": (
+        "Get current weather for a city. Use for ANY question about "
+        "temperature, rain, or what to wear."          # the WHEN-to-use clue
+    ),
+    "input_schema": {                                   # JSON-Schema contract
+        "type": "object",
+        "properties": {
+            "city":  {"type": "string", "description": "City name, e.g. 'Austin'"},
+            "units": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+        },
+        "required": ["city"],
+    },
+}]
+
+resp = client.messages.create(
+    model="claude-opus-4-8",
+    max_tokens=1024,
+    tools=TOOLS,
+    # phrased INDIRECTLY — never mentions "weather"
+    messages=[{"role": "user", "content": "Should I bring a jacket to my meeting in Austin?"}],
+)
+
+print(resp.stop_reason)                       # -> "tool_use"
+for block in resp.content:
+    if block.type == "tool_use":
+        print(block.name, block.input)        # -> get_weather {'city': 'Austin'}
+```
+
+**What just happened.** We never told the model "call `get_weather`." The rich `description` ("...for ANY question about ... what to wear") is the *only* thing that let it connect "jacket" → weather and decide to call the tool. The response comes back with `stop_reason == "tool_use"` — the model's way of saying *"I'm not answering yet; run this tool and give me the result."* The `tool_use` content block carries the `name` it chose and the `input` it filled in against your schema (`{'city': 'Austin'}` — note it left out the optional `units`). Blank out the description to `"weather tool"` and re-run: the model often answers from guesswork instead of calling the tool. Same code, different behavior — the description *is* the program.
+
 ## 2. Constrained / structured decoding — how valid JSON is guaranteed **[CORE]**
 
 ### The problem (first principles)
@@ -243,6 +477,39 @@ Valid JSON, wrong value:  {"city": "Austinnn", "units": "celsius"}   ← "Austin
 
 So you **still validate values** with Pydantic ([Phase 0](phase0-week1.md); Part 3). Constrained decoding gets you a parseable object; validation gets you a *sensible* one.
 
+### Runnable example — the layer constrained decoding *can't* give you (Pydantic)
+
+Constrained decoding guarantees the arguments arrive as valid JSON of the right types. It cannot know that `"Austinnn"` is not a real city. That's your job:
+
+```python
+from pydantic import BaseModel, field_validator
+
+KNOWN_CITIES = {"Austin", "Seattle", "Denver"}
+
+
+class WeatherArgs(BaseModel):
+    city: str                       # constrained decoding guarantees this is a STRING
+    units: str = "celsius"
+
+    @field_validator("city")
+    @classmethod
+    def city_must_exist(cls, v: str) -> str:
+        if v not in KNOWN_CITIES:   # ...but only YOU can check it's a REAL city
+            raise ValueError(f"unknown city: {v!r}")
+        return v
+
+
+# What the model emitted — structurally perfect JSON, semantically wrong:
+raw_args = {"city": "Austinnn", "units": "celsius"}
+
+try:
+    args = WeatherArgs(**raw_args)
+except ValueError as e:
+    print("rejected:", e)           # -> rejected: unknown city: 'Austinnn'
+```
+
+**Why both layers are needed.** By the time `raw_args` reaches your code, constrained decoding has already guaranteed it parses, that `city` is a string, and that `units` (if present) is one of the `enum` values — you will never get a trailing comma or a number where a string belongs. What it *can't* guarantee is meaning: `"Austinnn"` is a perfectly valid string and a nonsense city. The Pydantic `field_validator` is the second gate — it turns a well-typed-but-wrong argument into a clean `ValueError` you can catch. In Part 3 you'll return that failure to the model as a `422`-style result so it *fixes the argument and retries*, instead of executing a lookup that would blow up on garbage input.
+
 ## 3. Token economics of tools **[WORKING]**
 
 ### Why tool data is expensive — worked comparison
@@ -267,6 +534,42 @@ Trim it to 100 useful tokens:
 ```
 
 **Lean schemas and compact, model-readable tool outputs are a performance feature**, not polish. Return the 3 fields the model needs, not the raw 40-field API blob.
+
+### Runnable example — measuring the loop multiplier with real token counts
+
+Don't estimate with `tiktoken` (that's OpenAI's tokenizer and undercounts Claude). Use the model's own counter:
+
+```python
+import anthropic, json
+
+client = anthropic.Anthropic()
+
+raw = {                                   # what a weather API actually returns
+    "location": {"city": "Austin", "region": "TX", "country": "US",
+                 "lat": 30.27, "lon": -97.74, "tz": "America/Chicago"},
+    "current": {"temp_c": 34, "temp_f": 93, "condition": "clear", "humidity": 41,
+                "wind_kph": 12, "wind_dir": "SSE", "pressure_mb": 1012,
+                "uv": 8, "visibility_km": 16, "feelslike_c": 36},
+}
+lean = {"city": "Austin", "temp_c": 34, "condition": "clear"}   # what the model needs
+
+
+def toks(obj: dict) -> int:
+    r = client.messages.count_tokens(
+        model="claude-opus-4-8",
+        messages=[{"role": "user", "content": json.dumps(obj)}],
+    )
+    return r.input_tokens
+
+
+raw_t, lean_t = toks(raw), toks(lean)
+print(f"raw={raw_t}  lean={lean_t}")
+# A tool result appended at step 1 of a 5-step loop is RE-SENT at steps 2,3,4,5:
+print(f"raw re-sent cost = {raw_t * 4}   lean re-sent cost = {lean_t * 4}")
+# e.g. raw=120  lean=22  ->  raw re-sent cost = 480   lean re-sent cost = 88
+```
+
+**Reading the numbers.** `count_tokens` calls the same tokenizer the model uses to bill you, so these counts are exact, not approximate. The raw blob costs several times what the lean version does *per occurrence* — and because every appended tool result is permanent context re-sent on every later turn ([Phase 0](phase0-week1.md): statelessness ⇒ resend everything), that per-occurrence gap multiplies by the number of remaining steps. Trimming the 40-field blob to the 3 fields the model actually reads isn't cosmetic; it's a multiplicative cost and latency win that compounds across the whole agent loop.
 
 ## Failure modes & common mistakes (Part 2)
 
@@ -347,6 +650,80 @@ GOOD: you catch it and return a status-style result:
 ```
 
 A raw stack trace is the agentic equivalent of returning a naked `500` with a wall of text — the caller has nothing structured to act on. Status-style results turn tool failures into *recoverable* signals.
+
+### Runnable example — a ReAct loop whose tool speaks in HTTP-style signals (Anthropic SDK)
+
+This is the Week-2 loop with the Week-3 upgrade: the tool executor maps every outcome onto a `422`/`404`/success-style result, and marks failures with `is_error` so the model can classify and recover.
+
+```python
+import anthropic, json
+
+client = anthropic.Anthropic()
+ORDERS = {"abc": {"id": "abc", "status": "shipped"}}   # our "database"
+
+TOOLS = [{
+    "name": "get_order",
+    "description": "Look up an order by id. Use when the user asks about an order's status.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"id": {"type": "string", "description": "order id"}},
+        "required": ["id"],
+    },
+}]
+
+
+def run_tool(name: str, args: dict) -> dict:
+    """Execute the tool and map the outcome onto an HTTP-style signal."""
+    if name != "get_order":
+        return {"error": "unknown_tool"}                        # 404-style
+    order_id = args.get("id")
+    if not order_id:
+        return {"error": "invalid_argument", "field": "id",     # 422-style
+                "detail": "id is required"}                     #  -> model fixes its args
+    order = ORDERS.get(order_id)
+    if order is None:
+        return {"error": "not_found", "id": order_id}           # 404-style
+    return {"order": order}                                     # success
+
+
+messages = [{"role": "user", "content": "What's the status of order abc?"}]
+
+for _ in range(6):                                              # MAX_ITERS guard (Week 2)
+    resp = client.messages.create(
+        model="claude-opus-4-8", max_tokens=1024, tools=TOOLS, messages=messages,
+    )
+    if resp.stop_reason != "tool_use":                         # model is done — print answer
+        print(next(b.text for b in resp.content if b.type == "text"))
+        break
+
+    messages.append({"role": "assistant", "content": resp.content})   # keep the tool_use blocks
+    results = []
+    for block in resp.content:
+        if block.type == "tool_use":
+            out = run_tool(block.name, block.input)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,                        # MUST match the tool_use id
+                "content": json.dumps(out),
+                "is_error": "error" in out,                    # flag failures as failures
+            })
+    messages.append({"role": "user", "content": results})      # feed results back, loop again
+```
+
+Now the version that causes the runaway loop — the *only* change is the tool result:
+
+```python
+import traceback
+
+def run_tool_bad(name: str, args: dict) -> str:
+    try:
+        return json.dumps({"order": ORDERS[args["id"]]})       # KeyError on a missing id
+    except Exception:
+        # Returning the raw traceback gives the model nothing to CLASSIFY.
+        return traceback.format_exc()   # "Traceback (most recent call last): ... KeyError: 'xyz'"
+```
+
+**Trace both paths.** With `run_tool`, ask about a missing order (`"order xyz"`): the tool returns `{"error": "not_found", "id": "xyz"}` with `is_error=True`. The model reads that structured signal, recognizes retrying won't help, and tells the user the order doesn't exist — the loop ends cleanly. Swap in `run_tool_bad` and the tool returns a wall of traceback text; the model can't tell *"fix my input"* from *"retry later"* from *"give up,"* so it re-calls `get_order` with the same bad id, gets the same traceback, and repeats until the `range(6)` guard trips — six wasted API calls and a dead end. The mechanical pieces that make the good path work: append the assistant's `content` (with its `tool_use` blocks) **before** the results; return exactly one `tool_result` per `tool_use`, keyed by the matching `tool_use_id`; and set `is_error` so a failure reads as a failure. That is the whole thesis of the week in code — **a tool is an API call, and its result is the status code the model reasons over.**
 
 ## Interlink 3 — retry safety previews Week 4 **[CORE]**
 

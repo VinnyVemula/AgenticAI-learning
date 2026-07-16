@@ -143,6 +143,43 @@ alg  → verify it's the algorithm YOU expect — the "alg:none" and RS256→HS2
         confusion attacks exploit servers that trust the header's alg blindly.
 ```
 
+### Runnable example — verify vs. forge a JWT (PyJWT)
+
+```python
+# pip install pyjwt
+import jwt, time
+
+SECRET = "dev-only-secret"          # HS256 shared secret (RS256 would use a keypair)
+
+# Mint a token the way your auth server would:
+token = jwt.encode(
+    {"sub": "user-42", "role": "user", "aud": "api",
+     "iss": "auth.example", "exp": int(time.time()) + 300},
+    SECRET, algorithm="HS256",
+)
+
+# CORRECT — verify signature AND claims (exp/aud/iss checked for you):
+claims = jwt.decode(token, SECRET, algorithms=["HS256"],
+                    audience="api", issuer="auth.example")
+print("verified:", claims["sub"], claims["role"])       # -> verified: user-42 user
+
+# THE #1 AUTH BUG — an attacker forges admin claims with the WRONG key:
+forged = jwt.encode({"sub": "attacker", "role": "admin", "aud": "api",
+                     "iss": "auth.example"}, "WRONG-KEY", algorithm="HS256")
+
+# Decoding WITHOUT verifying happily believes the forgery:
+print("decode-only says:",
+      jwt.decode(forged, options={"verify_signature": False})["role"])   # -> admin  😱
+
+# Verifying rejects it — the signature is the whole security boundary:
+try:
+    jwt.decode(forged, SECRET, algorithms=["HS256"], audience="api", issuer="auth.example")
+except jwt.InvalidSignatureError:
+    print("verify() correctly REJECTED the forged token")               # <- this fires
+```
+
+**Why the forgery fails only under verification.** The payload of a JWT is just base64 — anyone can write `{"role":"admin"}` and encode it, which is exactly what `decode(..., verify_signature=False)` reads back (`admin`). What the attacker *cannot* produce is a signature over that payload made with your `SECRET`, because they don't have it. `jwt.decode(token, SECRET, algorithms=["HS256"], ...)` recomputes the signature and compares — the forged token's signature was made with `"WRONG-KEY"`, so it mismatches and raises `InvalidSignatureError`. Note the two other guards baked into the correct call: pinning `algorithms=["HS256"]` defeats the `alg:none` / algorithm-confusion attacks (the server never trusts the token's own `alg` header), and passing `audience`/`issuer` makes PyJWT reject a token minted for a different service or by a different auth server. Drop any of those and you reopen a real attack.
+
 ---
 
 ## 4. FastAPI / ASGI internals **[CORE]**
@@ -173,6 +210,56 @@ async def chat(msg: str, user: User = Depends(get_current_user)) -> Reply:
     ...   # `user` is GUARANTEED authenticated and scoped to THIS request
 ```
 `Depends(get_current_user)` runs auth *before* the handler body and hands it the resolved user. **Why it matters:** it's how per-request identity and resources are scoped cleanly — **no globals**, so one user's context can never leak into another's concurrent request ([Week 2](phase1-week2.md): many requests share one event loop).
+
+### Runnable example — auth as a real DI dependency (FastAPI + PyJWT)
+
+```python
+# app.py — pip install "fastapi[standard]" pyjwt ; run: uvicorn app:app --reload
+import jwt
+from dataclasses import dataclass
+from fastapi import FastAPI, Depends, HTTPException, Header
+
+app = FastAPI()
+SECRET = "dev-only-secret"
+
+
+@dataclass
+class User:
+    id: str
+    role: str
+
+
+async def get_current_user(authorization: str = Header(...)) -> User:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        claims = jwt.decode(token, SECRET, algorithms=["HS256"],      # VERIFY, don't just decode
+                            audience="api", issuer="auth.example")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="invalid or expired token")
+    return User(id=claims["sub"], role=claims["role"])
+
+
+@app.post("/chat")
+async def chat(msg: str, user: User = Depends(get_current_user)):
+    # `user` is GUARANTEED authenticated and scoped to THIS request — no globals.
+    return {"reply": f"hello {user.id} (role={user.role}); you said: {msg}"}
+```
+
+```bash
+# Mint a valid token (this is your auth server's job in real life):
+TOKEN=$(python -c "import jwt,time; print(jwt.encode({'sub':'u1','role':'user','aud':'api','iss':'auth.example','exp':int(time.time())+300},'dev-only-secret',algorithm='HS256'))")
+
+curl -s -X POST 'localhost:8000/chat?msg=hi' -H "Authorization: Bearer $TOKEN"
+# -> {"reply":"hello u1 (role=user); you said: hi"}
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST 'localhost:8000/chat?msg=hi' \
+  -H 'Authorization: Bearer garbage'
+# -> 401
+```
+
+**How DI makes this safe by construction.** The handler *declares* `user: User = Depends(get_current_user)`; FastAPI runs `get_current_user` first, and if the JWT fails verification it raises `401` **before the handler body ever runs** — the endpoint code can assume an authenticated user. Because `user` is a per-request value produced fresh each call (not a module global), two concurrent requests on the same event-loop worker ([Week 2](phase1-week2.md)) get their own `User` object — Alice's identity can't bleed into Bob's request. This is the exact seam Part 3 uses to flow the authenticated identity all the way down to the agent's tool credentials.
+
+---
 
 ### `lifespan` **[WORKING]**
 A context manager running once at startup/shutdown — open connection pools and HTTP clients **once** at boot and reuse them, closing at shutdown. Opening a DB pool *per request* instead would exhaust connections under load.
@@ -229,6 +316,47 @@ Streaming:     "Checking the weather..." (0.5s)
                → the user sees progress immediately; PERCEIVED latency plummets
 ```
 Total time is unchanged; *perceived* latency collapses. It requires a long-lived connection — **Server-Sent Events (SSE)** or **WebSockets** — which is *why* the ASGI server matters (Part 1 §ASGI). **[WORKING]** — know the pattern and that it rides on ASGI's streaming capability; the byte-level protocol is a black box.
+
+### Runnable example — streaming an agent's tokens over SSE (FastAPI + Claude)
+
+```python
+# stream_app.py — pip install "fastapi[standard]" anthropic ; uvicorn stream_app:app --reload
+from anthropic import AsyncAnthropic
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+client = AsyncAnthropic()          # async client — never blocks the event loop
+
+
+async def token_stream(prompt: str):
+    async with client.messages.stream(
+        model="claude-opus-4-8", max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        async for text in stream.text_stream:      # tokens as the model produces them
+            yield f"data: {text}\n\n"              # one SSE frame per chunk
+    yield "data: [DONE]\n\n"
+
+
+@app.get("/chat/stream")
+async def chat_stream(msg: str):
+    return StreamingResponse(token_stream(msg), media_type="text/event-stream")
+```
+
+```bash
+# -N disables curl's buffering so you SEE the tokens trickle in
+curl -N 'localhost:8000/chat/stream?msg=Write%20one%20sentence%20about%20Austin.'
+# data: Austin
+# data:  is
+# data:  the
+# ...tokens arrive live...
+# data: [DONE]
+```
+
+**Why this needs everything from Part 1.** `token_stream` is an **async generator**: each `yield` hands one chunk to the client and then `await`s the next token, so the single event-loop thread is free to serve other users between chunks — this is exactly why the ASGI server (not WSGI) is required, and why we use `AsyncAnthropic` rather than the sync client (a blocking model call here would freeze every concurrent stream, [Week 2](phase1-week2.md)'s trap). `StreamingResponse` with `media_type="text/event-stream"` turns the generator into an SSE response; the `data: ...\n\n` framing is the SSE wire format the browser's `EventSource` (or `curl -N`) reads incrementally. The total generation time is unchanged — but the user sees the first words in ~0.5s instead of staring at a spinner for the whole run.
+
+---
 
 ## 2. Per-user agent context & session identity **[CORE]**
 
@@ -333,6 +461,44 @@ Prompt-based "rule":  system prompt says "never refund" → attacker talks the m
 Backend authz:        issue_refund checks the injected user's role → read-only → 403, refused. ✅
 ```
 The inbound identity (via DI) determines the outbound authority: a read-only user's agent gets read-only tool credentials, full stop — enforced where the model can't override it.
+
+### Runnable example — a tool whose permission a prompt can't talk past
+
+```python
+from dataclasses import dataclass
+
+
+class PermissionError403(Exception):
+    pass
+
+
+@dataclass
+class User:
+    id: str
+    role: str          # "read_only" | "agent_admin" — comes from the verified JWT (Part 1)
+
+
+def issue_refund(user: User, order_id: str, amount: int) -> dict:
+    # Authorization is enforced HERE, in the backend — keyed off the DI-provided
+    # identity, NOT off anything the model was told in a prompt.
+    if user.role != "agent_admin":
+        raise PermissionError403("not permitted to issue refunds")
+    return {"refunded": amount, "order": order_id}
+
+
+# Scenario: a prompt-injected support ticket convinced the model to call the tool.
+# It doesn't matter what the model "decided" — the backend check is the real gate.
+alice = User(id="alice", role="read_only")
+try:
+    issue_refund(alice, "o1", 50)
+except PermissionError403 as e:
+    print("403:", e)          # -> 403: not permitted to issue refunds
+
+bob = User(id="bob", role="agent_admin")
+print(issue_refund(bob, "o1", 50))   # -> {'refunded': 50, 'order': 'o1'}
+```
+
+**Why the prompt can't win.** A system-prompt rule like *"never issue refunds for read-only users"* is a *request* to a model whose judgment an attacker can manipulate (the confused-deputy risk from Part 2). The `issue_refund` check is different in kind: it runs in **your** code, reads the `role` that came from the *verified* JWT (Part 1 §3, via the DI dependency), and raises `403` **before any refund happens** — regardless of what the model was tricked into requesting. The model supplies the *intent*; the backend decides the *authority*, and only the backend's decision is load-bearing. Wire `user` in via `Depends(get_current_user)` and every tool call inherits the caller's real scope automatically — the Alice/Bob crossing and the refund escalation are both closed structurally, not by prompt wording.
 
 ## Under the hood — one authenticated agent request **[CORE]**
 

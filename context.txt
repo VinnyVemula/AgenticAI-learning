@@ -145,7 +145,50 @@ This is a hard, non-negotiable rule, not a stylistic preference. Terse bullet li
 
 Calibration by tier still applies (Rule 6): `[CORE]` gets the full ladder to the metal; `[WORKING]` gets intuition + analogy + a worked example + the interface (internals named, not opened); `[AWARE]` gets at least intuition + one concrete example, then stops. **But the worked example in step 3 is mandatory at ALL three tiers** — there is no concept too small for one concrete example.
 
-The bar to meet, verbatim, is the Phase 1 study notes in this project (`notes/phase1-week*.md`): every sub-topic there has an intuition-first opening, a developed analogy, and a clearly-labeled worked example with real numbers/code/payloads/timelines. Match that density. If a section states a fact without showing it happening on a concrete input, the section is incomplete — expand it until it does.
+The bar to meet, verbatim, is the study notes already in this project (`notes/phase0-week1.md` and `notes/phase1-week*.md`): every sub-topic there has an intuition-first opening, a developed analogy, a clearly-labeled worked example with real numbers/code/payloads/timelines, **and — for anything with a runtime surface — a `### Runnable example` subsection containing complete runnable code, its real output, and a line-by-line explanation** (see Rule 11 and the RUNNABLE EXAMPLE STANDARD below). Match that density. If a section states a fact without showing it happening on a concrete input, the section is incomplete — expand it until it does.
+
+---
+
+## Rule 11 — Every runtime concept ships a *runnable* example, not pseudocode
+
+A worked example (Rule 10) shows the mechanism on concrete inputs; a **runnable** example proves it by being code the reader can paste and execute. For any concept with a runtime surface — anything a reader could actually run (an endpoint, an agent loop, an auth check, a token count, a concurrency demo) — the worked example in Rule 10 step 3 MUST be a complete, runnable program, followed by the command/`curl` that drives it, its real output, and a line-by-line explanation. No undefined helpers, no `...` stand-ins, no invented API surface. See **RUNNABLE EXAMPLE STANDARD** for the exact shape and the stack/API conventions. Pure-concept sub-topics with no runtime surface keep the Rule 10 worked example (numbers/timeline/payload) and are exempt — but do not reach for that exemption to avoid writing code that could exist.
+
+---
+
+# RUNNABLE EXAMPLE STANDARD (mandatory)
+
+This is the standard that produced the runnable examples in `notes/phase0-week1.md` and `notes/phase1-week*.md`. Match it exactly. It is *additive*: it does not replace the teaching ladder (Rule 10) — the runnable example **is** the load-bearing "worked example" step for any concept that can be run.
+
+## The shape of every runnable example
+
+Introduce each one under its own subheading — **`### Runnable example — <one-line what it shows>`** — placed immediately after that concept's intuition/analogy/worked explanation, and containing, in this order:
+
+1. **Complete, runnable code.** It must run as-is: real imports, the install line in a comment (`# pip install ...`), no undefined functions, no `...` placeholders, no pseudo-APIs. If a reader pastes it and it doesn't run, the example has failed.
+2. **The invocation + real output.** A `curl`, shell command, or `python file.py` call that drives the code, with the actual response/printout shown as comments (`# -> {...}`). For HTTP endpoints, show the status code where the status code is the point.
+3. **A line-by-line "why this works" paragraph.** After the code, explain what each load-bearing line does and *why*, tying it back to the concept's theory. This paragraph is mandatory; code without it is decoration, not teaching.
+
+## Honesty caveats (non-negotiable — this is Rule 7 applied to code)
+
+Runnable code exposes gaps that clean prose hides. When the real, running behavior differs from the tidy theory, say so *inside the example* rather than shipping code that lies:
+
+- If the framework's default contradicts the point being taught, show the code that actually achieves the taught behavior and name the gap (e.g. FastAPI returns `422`, not `400`, for unparseable JSON — so add the handler that downgrades it, and explain why).
+- If an API parameter the theory mentions is unavailable on the current stack, demonstrate the constraint and the real alternative (e.g. `temperature` is rejected on current Claude models — show the `BadRequestError` and how to get variety/determinism without it).
+- Mark demo-only shortcuts explicitly (`# demo only — never eval untrusted input`; in-memory stores that a real system replaces with a DB transaction / Redis). Never present a shortcut as production-ready.
+
+## Stack & API conventions (keep code accurate and current)
+
+- **Backend code:** FastAPI + Pydantic v2, `uv`-managed. Show `curl` transcripts. Prefer `async def` handlers and call out the blocking-call trap where relevant.
+- **Agentic / LLM code:** use **Claude via the official Anthropic Python SDK** (`pip install anthropic`), since this course is built on Claude. **Before writing any Anthropic code, consult the `claude-api` skill so the surface is current — do not write LLM API code from memory.**
+  - Default model: `claude-opus-4-8`. Use the exact ID string; never append a date suffix.
+  - Tool use = the manual loop: send `tools=[{name, description, input_schema}]`; read `resp.stop_reason == "tool_use"`; execute the `tool_use` block in *your* code; append the assistant `content`, then one `tool_result` per call keyed by `tool_use_id`; loop until `stop_reason != "tool_use"`. Always include a `MAX_ITERS` guard.
+  - Reasoning depth = **adaptive thinking** (`thinking={"type": "adaptive"}`), optionally `output_config={"effort": ...}`. `temperature`/`top_p`/`top_k` and `budget_tokens` are **removed** on current Claude models (they 400) — do not use them; steer via prompting/effort.
+  - Streaming = `AsyncAnthropic` + `messages.stream(...)` / `text_stream`, surfaced over SSE with `StreamingResponse`.
+  - Token counts = `client.messages.count_tokens(...)`, never `tiktoken`.
+- Every code block is standalone and pasteable; if two examples share setup, repeat the minimal imports rather than referencing "the previous snippet."
+
+## Augment, never gut
+
+When adding runnable examples to an existing note, **preserve all existing theory, analogies, and ASCII diagrams** and add the `### Runnable example` subsection alongside them. The ASCII timeline and the runnable code are complementary — the diagram is the quick-glance mental model, the code is the proof. Do not replace one with the other.
 
 ---
 
@@ -786,7 +829,11 @@ Before finalizing each section, verify:
 
 ✓ At least one visual diagram is included.
 
-✓ **STRICT (Rule 10): EVERY sub-topic has a concrete, clearly-labeled WORKED example** — real numbers, code, JSON payloads, or a step-by-step traced timeline showing the mechanism on concrete inputs — not merely a named fact or a vague mention. No sub-topic may be explained by a bare bullet list alone. Match the density of `notes/phase1-week*.md`.
+✓ **STRICT (Rule 10): EVERY sub-topic has a concrete, clearly-labeled WORKED example** — real numbers, code, JSON payloads, or a step-by-step traced timeline showing the mechanism on concrete inputs — not merely a named fact or a vague mention. No sub-topic may be explained by a bare bullet list alone. Match the density of `notes/phase0-week1.md` and `notes/phase1-week*.md`.
+
+✓ **STRICT (Rule 11 + RUNNABLE EXAMPLE STANDARD): every concept with a runtime surface has a `### Runnable example` subsection** — complete pasteable code (real imports, no `...` or undefined helpers), the driving command/`curl` with real output shown as comments, and a line-by-line "why this works" paragraph. Backend code is FastAPI/Pydantic; LLM code is Claude via the Anthropic SDK (`claude-opus-4-8`, manual tool loop, adaptive thinking, no `temperature`), written only after consulting the `claude-api` skill.
+
+✓ **Honesty caveats present where code diverges from theory** — framework defaults that contradict the point are shown corrected and named; unavailable API params are demonstrated as constraints with the real alternative; demo-only shortcuts (`eval`, in-memory stores) are explicitly flagged, never presented as production-ready.
 
 ✓ At least one real-world example is included.
 
@@ -857,6 +904,7 @@ Within each Part, take the reader from zero to deep understanding using the TEAC
 * Intuition & analogies (with where each analogy breaks)
 * Visual diagrams (ASCII/Markdown)
 * Internal architecture, step-by-step execution & under-the-hood (for [CORE] concepts)
+* A `### Runnable example` per runtime concept — complete code + real output + line-by-line explanation (Rule 11 / RUNNABLE EXAMPLE STANDARD)
 * Data flow, memory & runtime behavior
 * Performance, trade-offs & comparisons (use tables)
 * Failure modes, industry usage, best practices & common mistakes

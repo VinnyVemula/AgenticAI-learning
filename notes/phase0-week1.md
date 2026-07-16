@@ -281,6 +281,39 @@ Turn 2: you send "What's my name?"      model sees ["What's my name?"]        �
 
 **Consequences (the point of the week).** Memory is a **backend feature**, not a model feature. The context window is finite, so growing history must eventually be summarized, truncated, or retrieved — the seed of the later "memory/RAG" topic. And cost/latency scale with resent history: every turn re-pays for the whole transcript.
 
+### Runnable example — prove statelessness by hand (Anthropic SDK)
+
+```python
+# statelessness.py — pip install anthropic ; export ANTHROPIC_API_KEY=...
+import anthropic
+
+client = anthropic.Anthropic()
+
+
+def ask(messages: list[dict]) -> str:
+    resp = client.messages.create(model="claude-opus-4-8", max_tokens=256, messages=messages)
+    return next(b.text for b in resp.content if b.type == "text")
+
+
+# WITHOUT history — the second call has no idea the first ever happened:
+ask([{"role": "user", "content": "My name is Vinay."}])
+print("no history: ", ask([{"role": "user", "content": "What's my name?"}]))
+# -> "I don't know your name."      ← the model kept NO memory between calls
+
+# WITH history — the BACKEND (you) resends the whole transcript = "memory":
+history = [
+    {"role": "user", "content": "My name is Vinay."},
+    {"role": "assistant", "content": "Nice to meet you, Vinay."},
+    {"role": "user", "content": "What's my name?"},
+]
+print("with history:", ask(history))
+# -> "Your name is Vinay."          ← memory is JUST the list you chose to resend
+```
+
+**What this proves.** `ask` calls the exact same stateless function both times; the *only* difference is what you put in `messages`. When you omit the prior turns, the model genuinely cannot know your name — there is no server-side session storing it. When you resend `["My name is Vinay.", ..., "What's my name?"]`, the answer appears — because "conversation memory" is nothing more than the transcript **you** chose to send this call. This is `output = LLM(input)` made concrete: you have just implemented memory by hand, and you can see exactly why cost grows every turn (each call re-pays for the whole `history` list).
+
+---
+
 ## Mental Model 2 — An agent is a `while` loop around that function **[CORE]**
 
 **First principles.** An agent is ordinary code that repeatedly calls the LLM to decide and take actions until a goal is met: **perceive → reason → act → repeat → stop.** A single LLM call can only *say* things; to *do* things (search, read a file, call an API) and handle multi-step tasks, you wrap the call in a loop.
@@ -322,6 +355,69 @@ LOOP:
 ```
 
 **Examples.** *Beginner:* one `calculator` tool — "what's 17% of 2,340?" → model calls it → result fed back → model answers. *Real-world:* a coding agent — read file (tool) → edit (tool) → run tests (tool) → repeat until green. *Counter-example:* a single `LLM("summarize this")` call is **not** an agent — no loop, no tools, no state between steps.
+
+### Runnable example — the whole loop, with all four dependency arrows firing (Anthropic SDK)
+
+This is the "beginner" example above as running code — and it quietly demonstrates the Part 3 bridge: state persistence, tool execution, Pydantic-validated boundaries, and a stop guard.
+
+```python
+# mini_agent.py — pip install anthropic pydantic
+import anthropic
+from pydantic import BaseModel, field_validator
+
+client = anthropic.Anthropic()
+
+
+class CalcArgs(BaseModel):                      # the typed tool boundary (Part 1, INSIDE the loop)
+    expression: str
+
+    @field_validator("expression")
+    @classmethod
+    def only_math(cls, v: str) -> str:
+        if not set(v) <= set("0123456789+-*/.() "):
+            raise ValueError("expression contains non-math characters")
+        return v
+
+
+def calculator(args: CalcArgs) -> str:
+    return str(eval(args.expression, {"__builtins__": {}}, {}))   # demo only — never eval untrusted input
+
+
+TOOL_DEFS = [{
+    "name": "calculator",
+    "description": "Evaluate an arithmetic expression like '2340 * 0.17'.",
+    "input_schema": {"type": "object",
+                     "properties": {"expression": {"type": "string"}},
+                     "required": ["expression"]},
+}]
+
+messages = [{"role": "user", "content": "What is 17% of 2,340?"}]   # STATE (backend persists this)
+MAX_ITERS = 5
+
+for _ in range(MAX_ITERS):                          # STOP #2: the guard (backend CONTROL)
+    reply = client.messages.create(model="claude-opus-4-8", max_tokens=1024,
+                                   tools=TOOL_DEFS, messages=messages)   # Model 1: stateless call
+    messages.append({"role": "assistant", "content": reply.content})     # append -> "memory"
+
+    calls = [b for b in reply.content if b.type == "tool_use"]           # REASON: what did it choose?
+    if not calls:                                   # STOP #1: model gave a final answer
+        print(next(b.text for b in reply.content if b.type == "text"))
+        break
+
+    results = []
+    for call in calls:
+        try:
+            args = CalcArgs(**call.input)           # backend VALIDATES before acting (arrow 3)
+            out = calculator(args)                  # ACT: backend runs the tool (arrow 2)
+        except ValueError as e:
+            out = f"error: {e}"                     # malformed args caught by the BACKEND, not the model
+        results.append({"type": "tool_result", "tool_use_id": call.id, "content": out})
+    messages.append({"role": "user", "content": results})   # REPEAT: feed results back into state
+```
+
+**Every arrow from the dependency map, in one screen.** `messages` is the persisted **state** (arrow 1) — the same list you resent by hand in the previous example, now grown by the loop. `calculator` is the **action** the backend performs (arrow 2); the model only emitted `{"name": "calculator", ...}`. `CalcArgs(**call.input)` is the **validated boundary** (arrow 3): swap the calculator for one the model calls with `"__import__('os')"` and Pydantic rejects it *before* execution — the backend catches bad input, so the next model call never reasons over a crash. `range(MAX_ITERS)` is the **control** (arrow 4): remove it and a tool that always errors would loop forever, burning tokens. Count the model's involvement — exactly one line, `client.messages.create` — and everything else is backend engineering. That one-of-eight ratio *is* the thesis of the week.
+
+---
 
 ## Performance, trade-offs & comparison
 

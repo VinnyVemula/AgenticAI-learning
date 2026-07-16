@@ -119,6 +119,55 @@ p1.start(); p2.start(); p1.join(); p2.join()
 
 **The takeaway in one line:** threads are useless for CPU, useful for I/O; processes are the only route to CPU parallelism in Python.
 
+### Runnable example — measure the GIL yourself
+
+The snippets above used illustrative timings. Here is the complete, runnable version — run it and read the real numbers off your own machine.
+
+```python
+# gil_cpu.py — run with:  python gil_cpu.py
+import time
+from threading import Thread
+from multiprocessing import Process
+
+
+def count():                       # pure CPU work — holds the GIL the whole time
+    total = 0
+    for _ in range(50_000_000):
+        total += 1
+
+
+def run_two(worker_cls) -> float:
+    a, b = worker_cls(target=count), worker_cls(target=count)
+    t0 = time.perf_counter()
+    a.start(); b.start(); a.join(); b.join()
+    return time.perf_counter() - t0
+
+
+if __name__ == "__main__":                    # guard REQUIRED for multiprocessing
+    t0 = time.perf_counter(); count(); count()
+    print(f"serial (2x):  {time.perf_counter() - t0:.2f}s")
+    print(f"2 threads:    {run_two(Thread):.2f}s")     # ≈ serial — the GIL serializes bytecode
+    print(f"2 processes:  {run_two(Process):.2f}s")    # ≈ half — each process has its OWN GIL/core
+```
+
+```python
+# gil_io.py — the SAME two-worker shape, but the work is WAITING, not computing
+import time, threading
+
+
+def io_task():
+    time.sleep(1)                  # a stand-in for a network wait — sleep RELEASES the GIL
+
+
+t0 = time.perf_counter()
+threads = [threading.Thread(target=io_task) for _ in range(3)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"3 threads on I/O: {time.perf_counter() - t0:.2f}s")   # ≈ 1s, not 3s
+```
+
+**What the numbers prove.** In `gil_cpu.py`, "2 threads" comes out roughly equal to serial because both threads want the GIL and only one runs bytecode at a time — you get interleaving, not parallelism. "2 processes" comes out ≈ half because each process is a separate interpreter with its *own* GIL on its own core: genuine parallelism. Flip to `gil_io.py` and threads suddenly win — three 1-second waits finish in ≈1 second total — because `time.sleep` (like any blocking I/O call) *releases* the GIL, so the other threads run during each wait. Same threads, opposite result: the deciding factor is whether the bottleneck is computing (GIL blocks you) or waiting (GIL steps aside). The `if __name__ == "__main__"` guard isn't optional — `multiprocessing` re-imports the module in each child, and without the guard that re-import would spawn processes recursively.
+
 ### Visual
 
 ```
@@ -195,6 +244,38 @@ Serial would have been 2 + 1 = 3s. The loop got it in 2s (the *longest* wait), o
 
 `results = await asyncio.gather(coro1, coro2, coro3)` schedules all coroutines concurrently and returns when all finish. **Wall-clock ≈ the slowest one, not the sum.** It is *the* primitive for firing independent network calls at once (and, in Part 3, independent tool calls).
 
+### Runnable example — serial vs. `gather`, timed
+
+```python
+# gather.py — run with:  python gather.py
+import asyncio, time
+
+
+async def fetch(name: str, seconds: float) -> str:
+    print(f"{name}: start")
+    await asyncio.sleep(seconds)          # stand-in for a network wait
+    print(f"{name}: done")
+    return name
+
+
+async def serial():
+    t0 = time.perf_counter()
+    await fetch("A", 1); await fetch("B", 1); await fetch("C", 1)   # one after another
+    print(f"serial: {time.perf_counter() - t0:.2f}s")               # ≈ 3s
+
+
+async def concurrent():
+    t0 = time.perf_counter()
+    await asyncio.gather(fetch("A", 1), fetch("B", 1), fetch("C", 1))  # all at once
+    print(f"gather: {time.perf_counter() - t0:.2f}s")                  # ≈ 1s
+
+
+asyncio.run(serial())
+asyncio.run(concurrent())
+```
+
+**Why `gather` is ≈1s, not ≈3s.** In `serial()`, each `await fetch(...)` fully completes before the next one starts — the loop parks on A, wakes it, *then* starts B. In `concurrent()`, `gather` schedules all three coroutines before awaiting any of them, so all three hit their `await asyncio.sleep(1)` at t=0 and park together; the three waits overlap and the whole thing finishes at ≈1s (the *longest* wait), all on one thread at ~0% CPU. This is the exact primitive Part 3 uses to fire a model's independent tool calls at once.
+
 ### Memory perspective — why coroutines scale where threads can't
 
 A parked coroutine stores only its tiny stack frame (its local variables + the resume point) — a few kilobytes. A thread reserves a full OS stack, often ~1 MB. So:
@@ -247,6 +328,33 @@ async def report():
         data = await c.get("https://slow-api")             # yields to the loop
     return await asyncio.to_thread(heavy_cpu_crunch, data) # CPU off the loop
 ```
+
+### Runnable example — watch one blocking call serialize everything
+
+```python
+# blocking_trap.py — run with:  python blocking_trap.py
+import asyncio, time
+
+
+async def good():
+    await asyncio.sleep(1)          # yields the thread back to the loop
+
+
+async def bad():
+    time.sleep(1)                   # BLOCKS the one thread — never yields
+
+
+async def run(task, label: str):
+    t0 = time.perf_counter()
+    await asyncio.gather(*(task() for _ in range(5)))   # 5 concurrent tasks
+    print(f"{label}: {time.perf_counter() - t0:.2f}s")
+
+
+asyncio.run(run(good, "await asyncio.sleep"))   # ≈ 1s — the 5 waits overlap
+asyncio.run(run(bad,  "blocking time.sleep  ")) # ≈ 5s — they serialize; loop frozen each second
+```
+
+**The whole trap in five lines of difference.** Both versions `gather` five tasks. `good()` uses `await asyncio.sleep(1)`, which parks the coroutine and returns the single thread to the loop — so all five park at t=0 and finish together at ≈1s. `bad()` uses the *synchronous* `time.sleep(1)`, which holds the one thread and never yields — so task 1 must fully finish before task 2 can even start, and five tasks serialize to ≈5s. In a web server or agent this is catastrophic: the frozen thread is shared by *every* concurrent request, so one blocking call stalls all of them (the 100× collapse above). The fix is always the same — use an async library, or push the unavoidable blocking/CPU work off the loop with `await asyncio.to_thread(...)`.
 
 ---
 
@@ -366,6 +474,73 @@ step 2: llm() now has both facts, replies with PROSE (no tool_call):
 
 Three passes through the loop, two tool calls, one final answer. Each pass re-sent the *entire* growing `messages` list (Part 1's I/O cost — see Part 3).
 
+### Runnable example — the hand-rolled ReAct loop, end to end (Anthropic SDK)
+
+The loop above is pseudocode (`llm`, `run_tool`, `tool_message` are stand-ins). Here is the *complete, runnable* ~30 lines every framework wraps — the same "17% of 2,340" run against Claude.
+
+```python
+# react.py — pip install anthropic ; export ANTHROPIC_API_KEY=...
+import anthropic
+
+client = anthropic.Anthropic()
+
+
+def calculator(expression: str) -> str:
+    # Demo only — NEVER eval untrusted input in production.
+    return str(eval(expression, {"__builtins__": {}}, {}))
+
+
+TOOL_DEFS = [{
+    "name": "calculator",
+    "description": "Evaluate an arithmetic expression, e.g. '2340 * 0.17' or '397.8 > 400'.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"expression": {"type": "string"}},
+        "required": ["expression"],
+    },
+}]
+
+
+def run_tool(name: str, args: dict) -> str:      # <-- YOUR code executes, not the model
+    if name == "calculator":
+        return calculator(args["expression"])
+    return f"unknown tool: {name}"
+
+
+messages = [{"role": "user",                      # the ENTIRE state — resent every turn
+             "content": "What is 17% of 2,340, and is that more than 400?"}]
+MAX_ITERS = 6
+
+for step in range(MAX_ITERS):                     # STOP #2: mandatory loop guard
+    reply = client.messages.create(model="claude-opus-4-8", max_tokens=1024,
+                                   tools=TOOL_DEFS, messages=messages)   # the network call
+    messages.append({"role": "assistant", "content": reply.content})     # record the turn
+
+    tool_calls = [b for b in reply.content if b.type == "tool_use"]
+    if not tool_calls:                            # STOP #1: model produced a final answer
+        print(next(b.text for b in reply.content if b.type == "text"))
+        break
+
+    results = []
+    for call in tool_calls:                       # the model may request several at once
+        out = run_tool(call.name, call.input)
+        print(f"[step {step}] {call.name}({call.input}) -> {out}")
+        results.append({"type": "tool_result", "tool_use_id": call.id, "content": out})
+    messages.append({"role": "user", "content": results})   # feed results back -> loop again
+else:
+    raise RuntimeError("hit MAX_ITERS")           # guard tripped -> hard stop
+```
+
+Typical output:
+
+```
+[step 0] calculator({'expression': '2340 * 0.17'}) -> 397.8
+[step 1] calculator({'expression': '397.8 > 400'}) -> False
+17% of 2,340 is 397.8, which is not more than 400.
+```
+
+**Mapping code to the mental model.** `messages` is the whole state (Perceive), re-sent on every `create` call because the model is stateless. `client.messages.create` is the Reason step — it returns either a `tool_use` block (the model chose to act) or plain `text` (a final answer). `run_tool` is the Act step: **your** code runs the calculator; the model only *asked* for it. The two stops are visible: `if not tool_calls` is STOP #1 (the natural finish), and `for step in range(MAX_ITERS)` with the `else` clause is STOP #2 (the guard that fires if the model gets stuck looping — remove it and a flaky tool could burn tokens forever). Two mechanical rules the API enforces: append the assistant's `content` (with its `tool_use` blocks) **before** the results, and return exactly one `tool_result` per `tool_use`, keyed by `tool_use_id` — get the order wrong and the next `create` call errors.
+
 ### Why two stop conditions? (the "why", not just the "what")
 
 The natural stop is the model answering (STOP #1). The **guard** (STOP #2) exists because a model can get stuck: it repeatedly calls a tool that keeps returning an error, or ping-pongs between two tools, never converging. Without a hard cap, that is an **infinite loop burning tokens and real money** every iteration. Example: a `search` tool is down and returns an error; a guardless agent may call it 10,000 times. **The guard is mandatory, not optional.** Ideally you also add a *budget* guard (max tokens / max dollars).
@@ -437,6 +612,35 @@ When the model requests several tools in one turn (Part 2's `for call in reply.t
 # gather:   await asyncio.gather(w("Austin"), w("Dallas"), w("Houston")) → ~1s
 ```
 Same result, one-third the wall-clock — a direct application of Part 1's `gather`.
+
+### Runnable example — fan out a turn's tool calls concurrently
+
+```python
+# concurrent_tools.py — run with:  python concurrent_tools.py
+import asyncio, time
+
+
+async def get_weather(city: str) -> dict:
+    await asyncio.sleep(1)                 # stand-in for a ~1s weather API call
+    return {"city": city, "temp_c": 34}
+
+
+async def main():
+    cities = ["Austin", "Dallas", "Houston"]   # what the model asked for in ONE turn
+
+    t0 = time.perf_counter()                    # serial: one after another
+    serial = [await get_weather(c) for c in cities]
+    print(f"serial: {time.perf_counter() - t0:.2f}s")          # ≈ 3s
+
+    t0 = time.perf_counter()                    # concurrent: all three at once
+    together = await asyncio.gather(*(get_weather(c) for c in cities))
+    print(together, f"gather: {time.perf_counter() - t0:.2f}s")  # ≈ 1s
+
+
+asyncio.run(main())
+```
+
+**Wiring this into the ReAct loop.** When a turn returns several independent `tool_use` blocks (Part 2's `for call in tool_calls`), don't `await` them one at a time — build a coroutine per call and `await asyncio.gather(*coros)`. The three 1-second waits overlap into ≈1 second on the one thread, exactly as in Part 1. The only precondition is *independence*: if tool B needs tool A's result, they must stay sequential. This is the concrete payoff of recognizing the agent loop as an async I/O-bound workload — the same `gather` that speeds up any batch of network calls speeds up a model's parallel tool requests.
 
 ## Interlink 3 — the blocking trap becomes a *fleet-wide outage* **[CORE]**
 
