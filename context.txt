@@ -155,6 +155,33 @@ A worked example (Rule 10) shows the mechanism on concrete inputs; a **runnable*
 
 ---
 
+## Rule 12 — STRICT: every sub-topic carries **at least 2 system-design concepts**
+
+This is a hard, non-negotiable rule. **Every named sub-topic** (each `[CORE]`/`[WORKING]`/`[AWARE]` item, each numbered sub-section within a Part) MUST include a clearly-labeled **`### System design`** block containing **at least two** distinct system-design concepts, scenarios, or decisions that use the sub-topic. Each of the two must:
+
+1. **State a concrete design problem** ("Design a distributed rate limiter for 1M req/s", "Choose a consistency level for a payment ledger") — not a vague prompt.
+2. **Work through it** — requirements/constraints → the key decision(s) → the trade-off being made → the failure modes → why this design over the alternative. A named scenario with no reasoning is not enough.
+3. **Connect to the concept being taught** — the design must actually exercise the sub-topic, and where relevant, cross-reference concepts from other days/Parts (the whole course is one connected system — see KNOWLEDGE CONNECTIONS).
+
+The two concepts must be genuinely distinct (different problems or opposite ends of a trade-off), not one idea phrased twice. Prefer designs that mirror what appears in the study plan's per-day "System design (2)" entries, and go deeper than the one-liner there. For `[AWARE]` concepts, the two designs may be lighter (a paragraph each) but must still be present.
+
+---
+
+## Rule 13 — STRICT: every topic carries **multiple real, named case studies** (including failures)
+
+Abstract explanation without real-world grounding does not stick and does not build production judgment. **Every major concept/sub-topic** MUST include a clearly-labeled **`### Case studies`** block with **at least two** *real, named* case studies — a specific company, system, incident, paper, or product, not "imagine a company that…". At least one, wherever the topic allows, MUST be a **failure / postmortem** (a named outage, breach, or bug), because failures teach the mechanism better than successes. For each case study: name it, say *what happened*, and extract *the engineering lesson* that ties back to the concept. Cite the primary source (postmortem, paper, engineering blog — Rule 7). Where a case study drifts fast (product features, pricing), flag "verify current".
+
+---
+
+## Rule 14 — STRICT: every topic carries **production practices** and full term-necessity
+
+- **Production practices.** Every concept must include how it is actually used, operated, and gotten wrong **in production** — a `### In production` treatment (or clearly-labeled equivalent) covering: best practices, common mistakes / anti-patterns (beginner → senior), monitoring/observability of it, failure modes and recovery, scaling behavior, and cost. Theory without operational reality is incomplete.
+- **Term necessity (Rules 2 + 5 sharpened).** For **every** technical term introduced, do not merely define it — state **what problem it solves, why it was necessary, and what people did before it existed** (the pain that motivated it). A term the reader can define but cannot say *why it exists* has not been taught.
+
+**Narrow exemption to Rules 12–14.** Pure-fundamentals on-ramp material — specifically the study plan's **Prerequisite days (P1–P4: Python, Git, shell)** and the **math on-ramp (Day 58½)** — may omit the `### System design`, `### Case studies`, and `### In production` blocks, because these topics have no meaningful production/design/postmortem surface at that level. They must still honor every *other* rule (teaching ladder, runnable examples, term necessity, recall). This exemption applies to nothing else: from Day 1 onward, Rules 12–14 are mandatory.
+
+---
+
 # RUNNABLE EXAMPLE STANDARD (mandatory)
 
 This is the standard that produced the runnable examples in `notes/phase0-week1.md` and `notes/phase1-week*.md`. Match it exactly. It is *additive*: it does not replace the teaching ladder (Rule 10) — the runnable example **is** the load-bearing "worked example" step for any concept that can be run.
@@ -835,6 +862,12 @@ Before finalizing each section, verify:
 
 ✓ **Honesty caveats present where code diverges from theory** — framework defaults that contradict the point are shown corrected and named; unavailable API params are demonstrated as constraints with the real alternative; demo-only shortcuts (`eval`, in-memory stores) are explicitly flagged, never presented as production-ready.
 
+✓ **STRICT (Rule 12): EVERY sub-topic has a `### System design` block with ≥2 distinct, worked design concepts** — each stating a concrete problem, working through requirements → decision → trade-off → failure modes, and exercising the sub-topic. Not one idea phrased twice.
+
+✓ **STRICT (Rule 13): EVERY major concept has a `### Case studies` block with ≥2 real, named case studies** — specific companies/systems/incidents/papers, at least one a failure/postmortem where the topic allows, each with the extracted lesson and a primary source.
+
+✓ **STRICT (Rule 14): EVERY concept has a `### In production` treatment** (best practices, common mistakes beginner→senior, monitoring, failure modes + recovery, scaling, cost) AND every term states what problem it solves / why it was necessary / what came before.
+
 ✓ At least one real-world example is included.
 
 ✓ At least one industry example is included.
@@ -907,6 +940,9 @@ Within each Part, take the reader from zero to deep understanding using the TEAC
 * A `### Runnable example` per runtime concept — complete code + real output + line-by-line explanation (Rule 11 / RUNNABLE EXAMPLE STANDARD)
 * Data flow, memory & runtime behavior
 * Performance, trade-offs & comparisons (use tables)
+* A `### System design` block per sub-topic — ≥2 worked design concepts (Rule 12)
+* A `### Case studies` block per major concept — ≥2 real, named case studies incl. a failure/postmortem (Rule 13)
+* A `### In production` block — best practices, anti-patterns, monitoring, failure modes + recovery, scaling, cost (Rule 14)
 * Failure modes, industry usage, best practices & common mistakes
 * Interview questions & practice questions for that Part
 
