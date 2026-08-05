@@ -1,1824 +1,1137 @@
-# Day 4 — The OS III: Memory Management
+# Day 4 — The OS III: Memory Management (Virtual Memory, Pages, Stack vs Heap, the OOM Killer, and Python's Heap)
 
-> **Framing.** This note is about one question: *when your program says "give me memory," who actually gives it, what do they give, and when do they take it back?*
+> **Framing.** Day 2 gave each process its own isolated box; Day 3 put many threads inside one box sharing its memory and showed how that sharing races. Today we open the box's memory itself and ask the question every one of those threads secretly depends on: *when a program says `x = [0] * 1_000_000`, where do those bytes actually live, who hands them out, and what happens when you ask for more than the machine has?* The answer is one of the most beautiful lies in computing — **virtual memory**: the OS convinces every process that it alone owns a vast, contiguous, private span of RAM, while behind the curtain it hands out physical memory in 4 KB **pages**, on demand, lazily, and reclaims it the instant you run out (the **OOM killer**). You will learn what a **page fault** physically triggers, why the **stack** frees itself but the **heap** does not, why a Python object costs ~28 bytes instead of 8, why a Python "memory leak" is almost never lost memory but a **lingering reference**, and why Python so often refuses to give freed memory back to the operating system.
 >
-> You will learn: virtual memory and page tables (why every process believes it owns the whole machine), the TLB, page faults, swap, stack vs heap, how `malloc` really works, the OOM killer and container memory limits, and then CPython's own memory system on top of all of it — reference counting, the cycle-collecting GC, pymalloc arenas, and the reason a Python worker's RSS goes up and never comes back down.
+> **Who it's for.** Someone who has never heard "virtual memory," thinks a pointer is a physical RAM address, believes `del x` frees memory to the OS, and has never watched a container get killed at 3 a.m. for using 2 MB too much. We build from zero. Depends on Day 1 (the latency pyramid: RAM ≈ 100 ns, SSD/swap ≈ 100 µs — a 1000× cliff that makes swap catastrophic) and Day 2 (a process is an address space + descriptors); it is cross-referenced, not re-explained.
 >
-> **Who it's for.** Someone who has never read a page table diagram, never typed `ulimit`, and has only a fuzzy sense that "the heap is where objects go." Zero prior knowledge assumed. Every term is defined at first use, together with what problem it solved and what people did before it existed.
->
-> **The ONE idea that unites the backend and agentic layers:**
->
-> > **Memory is a bounded resource that is *lied about* at every layer, and every serious capacity failure — a pod dying nightly at 3 a.m., an LLM server that throughputs 8 requests instead of 60 — is the moment one of those lies is called.**
->
-> The kernel lies to your process ("you have 128 TiB of address space"). The allocator lies to the kernel ("I still need this heap"). Python lies to the allocator ("this arena is still in use — one live object is in it"). The container runtime lies to Java and Node ("the machine has 64 GiB"). And in Part 2 you'll meet the newest lie: an LLM inference server lies to its scheduler about how much KV cache a request will need. Part 3 is where the backend's lies and the agentic layer's lies collide inside one production system.
->
-> **Depth map.** `[CORE]` = opened to the metal. `[WORKING]` = you must use it correctly and reason about trade-offs, but not reimplement it. `[AWARE]` = know it exists and when to reach for it.
->
-> | Concept | Tier |
-> |---|---|
-> | Physical memory & the address | [CORE] (prerequisite, folded into virtual memory) |
-> | Virtual memory, pages, page tables, TLB, page faults, CoW, swap | **[CORE]** |
-> | Stack vs heap | **[CORE]** |
-> | `malloc`/`free` internals (glibc) | [WORKING] |
-> | Kernel limits, overcommit, cgroups, the OOM killer | **[CORE]** |
-> | CPython memory model: PyObject, refcounting, GC, pymalloc | **[CORE]** |
-> | Measuring memory (RSS/VMS/USS/PSS, tracemalloc) | [WORKING] |
-> | Alternative allocators (jemalloc/tcmalloc), huge pages | [AWARE] |
-> | LLM inference is memory-bound (bandwidth roofline) | **[CORE]** |
-> | KV cache sizing | **[CORE]** |
-> | PagedAttention / vLLM block manager | [WORKING] |
-> | Agent-process host memory (history growth, RAG buffers) | **[CORE]** |
-> | Vector index / embedding memory | [WORKING] |
-> | Quantization, weight offload, prefix caching | [AWARE] |
->
-> **A note on running the code.** Most examples are Linux-first, because memory management is where operating systems differ most and Linux is what your containers run. Every example says explicitly what it needs. If you are on Windows, install WSL2 (`wsl --install`) and run them in an Ubuntu shell, or use `docker run -it --rm -v ${PWD}:/w -w /w python:3.11 bash`. Where Windows behaves differently in a way that matters, I say so inline rather than pretending the code is portable.
+> **The ONE idea that unites the backend and agentic layers:** *memory is a finite physical budget you are only lent the illusion of owning — and the discipline of living inside the real budget is identical whether you are sizing a container, hunting a Python reference leak, or trimming an agent's conversation history and KV cache.* A backend worker that never trims a growing global `dict` and an AI agent that re-sends an ever-longer conversation every turn are **the same bug**: state that should have been bounded, growing without a ceiling, until the process crosses a hard limit and the OOM killer ends it — no exception, no stack trace, just a `SIGKILL` and a restart. Get it wrong in a backend and a pod CrashLoopBackOffs; get it wrong in an agent and every user conversation on that worker dies mid-sentence, *and* the token bill grows quadratically on the way down. This is the day "out of memory" stops being magic.
+
+**A note on platform.** Virtual memory, pages, `/proc`, `RLIMIT_AS`, `cgroups`, and the OOM killer are **Linux** concepts. Windows has analogous machinery (the Memory Manager, working sets, the pagefile, Job Objects) with different names. Every runnable example below is written for **Linux** — run them in WSL2 (`wsl --install`, then `wsl`), a container (`docker run -it --rm -m 256m -v "$PWD":/w -w /w python:3.12 bash` — note the `-m 256m` memory cap, which we'll use), or any Linux VM. Where Windows or CPython specifics diverge, I say so explicitly.
+
+**A note on Python's GC and free-threading.** CPython's **reference counting** is [CORE] today because it dictates *when* memory is freed and *why* CoW breaks. The **cyclic garbage collector** and **pymalloc** are [CORE] at the "know the mechanism and its failure modes" level. The full GIL story is Day 20; the KV-cache internals of transformer inference are Day 63 — both are cross-referenced, not opened here.
+
+**Reading order.** Part 1 builds the OS memory machinery (virtual memory → pages/TLB → page faults/swap → stack vs heap → OOM killer → Python's heap). Part 2 builds the agent's memory model on top of it — the context window as a RAM-like budget, the KV cache as the memory-bound bottleneck, and the agent "memory leak" of unbounded history — treating the backend as a black box. Part 3 is where a backend worker and an agent share **one physical memory budget** and get OOM-killed together.
 
 ---
 
 # PART 1 — BACKEND
 
-## 1. First principles: what "memory" physically is
-
-**Depth: [CORE]** (this is the prerequisite the rest of Part 1 rests on, so we resolve it before touching virtual memory — Principle 4.)
-
-### Intuition — why addresses exist at all
-
-A stick of RAM is a very long row of numbered boxes. Each box holds exactly **8 bits = 1 byte** — a number from 0 to 255. That's all. No types, no names, no objects. A 16 GiB DIMM is 17,179,869,184 such boxes.
-
-To read a box you need its **number**. That number is an **address**. Everything else in this note is about the machinery for turning "the variable `x`" into "box number 140,732,708,915,432."
-
-Why numbered boxes and not names? Because the hardware is a decoder circuit: you put a binary number on the address lines, and the physical wiring selects one row of capacitors. A name would require a lookup table, and the lookup table would itself have to live in numbered boxes. Numbers are the ground floor.
-
-**A word.** The CPU doesn't like fetching one byte at a time. A 64-bit CPU natively moves 8 bytes (a **word**) and its cache moves 64 bytes (a **cache line**) at a time. This is why an 8-byte `int64` at address 1000 is fast and one straddling addresses 1020–1027 (crossing a 64-byte line boundary at 1024) costs two fetches. That's **alignment**, and it's why almost every structure you'll see below is padded to 8-byte multiples.
-
-### Worked example — the address space arithmetic that shapes everything
-
-A 64-bit register can hold addresses from 0 to 2⁶⁴−1 = 18.4 **exabytes**. No machine has that. So real x86-64 CPUs implement only the low **48 bits** (256 TiB), and Linux splits it: the low 128 TiB for your process, the high 128 TiB for the kernel. Newer CPUs with the *LA57* feature implement 57 bits (128 PiB) using a five-level page table; Linux only hands out addresses above 128 TiB if you explicitly ask, precisely because decades of software packed flags into the unused high bits of pointers.
-
-That's why a Linux pointer printed in hex looks like `0x7ffd4c2a1f38` — twelve hex digits = 48 bits — and never like `0xffff_ffff_ffff_ffff`.
-
-**Under the hood:** the unused 16 high bits aren't free-for-all. The CPU requires them to be *sign-extended* copies of bit 47 ("canonical form"). `0x0000_7fff_...` (user) and `0xffff_8000_...` (kernel) are canonical; `0x1234_7fff_...` faults immediately. This is a hardware-enforced tripwire that catches pointer corruption early.
-
-**Where we deliberately stop:** DRAM internals — rows, columns, refresh cycles, RAS/CAS latency, bank conflicts — are a black box for this note. You need them for database storage-engine tuning and HPC kernels, not for sizing a service. If a project forces you deeper, start with the memory-controller chapter of any computer-architecture text.
-
----
-
-## 2. Virtual memory: every process believes it owns all of RAM
-
-**Depth: [CORE].** This is *the* load-bearing idea of the day. We open every box.
-
-### Intuition — what problem it solved, and what people did before
-
-Run this thought experiment. It's 1975. Your machine has 64 KiB of RAM and programs address it directly: your program's variable `x` lives at physical byte 4096, full stop. Now:
-
-1. **You cannot run two programs at once safely.** Program B also wants byte 4096. Whoever writes last wins, and the other program corrupts silently. This was real: early home computers ran one program at a time, and a bug in it took down the machine.
-2. **You cannot relocate.** The compiler baked `4096` into the instruction stream. Load the program at a different address and every reference breaks. The workaround was hand-written *position-independent code* and a linker step called relocation, performed at load time by rewriting the program's bytes.
-3. **You cannot run a program bigger than RAM.** The workaround was **overlays**: the programmer manually partitioned the program into chunks and wrote explicit code to swap chunks in and out of a fixed region. Programmers really did draw overlay trees on paper. Get it wrong and you got garbage.
-4. **You have no protection.** Any program can read any other's data, including the OS's.
-
-**Virtual memory** solves all four with one move: **insert a translation layer between the addresses programs use and the addresses RAM uses.**
-
-- Program uses **virtual addresses** (VA). Every process gets its own private numbering starting at 0.
-- RAM has **physical addresses** (PA).
-- A hardware unit called the **MMU** (Memory Management Unit), configured by the kernel, translates VA→PA on *every single memory access*.
-
-Now: two processes can both use VA `0x1000` and be translated to different physical pages (isolation solved). A program can be loaded anywhere because its VAs never change (relocation solved). A VA can map to *nowhere yet* and be filled in on demand from disk (bigger-than-RAM solved). And a VA with no valid mapping traps to the kernel (protection solved — that's your segfault).
-
-### Analogy — the hotel switchboard
-
-A hotel where every guest is told "your room is Room 1." Guest A in "Room 1" and Guest B in "Room 1" are physically in different rooms — 214 and 507 — and the front desk keeps the mapping. Guests use the number they were given; the switchboard translates. Guest A asking for "Room 1" can never reach Guest B's room, because the translation is per-guest.
-
-**Where the analogy breaks — and this matters:**
-1. **The front desk is not consulted per phone call; it is consulted per *word* of memory, billions of times a second.** A human switchboard would be infinitely too slow. This is why translation is done in *hardware* (the MMU) with a *cache* (the TLB), and why the entire design is shaped by making translation nearly free. A hotel analogy gives you no intuition for the cost pressure that produces page tables and TLBs.
-2. **Rooms in the analogy always exist.** In virtual memory, "Room 1" routinely maps to *nothing at all* until you first knock on the door — the room is built at the moment of first entry (demand paging). There is no hotel equivalent to a room that materializes when you turn the handle.
-3. **Two guests can be assigned the same physical room on purpose** (shared memory, shared libraries, copy-on-write). The analogy makes that sound like a booking error; in virtual memory it's the single biggest memory-saving mechanism on the machine.
-
-### The mechanism: pages, page tables, and the walk
-
-Translating every individual byte address would need a table with one entry per byte — a table bigger than the memory it describes. So translation works on fixed-size blocks called **pages**.
-
-- **Page** = the unit of virtual memory. On x86-64 and most ARM64 Linux: **4 KiB**. (Apple Silicon macOS uses 16 KiB; ARM64 supports 4/16/64 KiB. "Huge pages" of 2 MiB and 1 GiB exist — see §2.7.)
-- **Frame** (or *page frame*) = the same-size unit of *physical* memory. Same size, different namespace.
-
-Split a 48-bit virtual address like this:
-
-```
- 47                                                12 11              0
-+-----------------------------------------------------+---------------+
-|              virtual page number (36 bits)          | offset (12 b) |
-+-----------------------------------------------------+---------------+
-                          |                                    |
-                 translated via page tables            copied through
-                          |                                    |  unchanged
-                          v                                    v
-+-----------------------------------------------------+---------------+
-|             physical frame number                   | offset (12 b) |
-+-----------------------------------------------------+---------------+
-```
-
-The low 12 bits (4 KiB = 2¹²) are the **offset within the page** and pass through untouched. Only the page number is translated. This is the trick that makes the table 4096× smaller.
-
-But 36 bits of page number = 68.7 billion pages. A flat array of 8-byte entries would be 549 GiB per process. Unacceptable. So the table is a **radix tree** — a tree indexed by slices of the address. On x86-64, four levels, 9 bits each:
-
-```
- 47      39 38      30 29      21 20      12 11         0
-+----------+----------+----------+----------+------------+
-|  PML4    |   PDPT   |    PD    |    PT    |   offset   |
-|  9 bits  |  9 bits  |  9 bits  |  9 bits  |  12 bits   |
-+----------+----------+----------+----------+------------+
-   index      index      index      index
-
-CR3 register ──► PML4 table (4 KiB, 512 entries × 8 B)
-                    └─[idx]─► PDPT   (4 KiB, 512 entries)
-                                └─[idx]─► PD    (4 KiB, 512 entries)
-                                            └─[idx]─► PT (4 KiB, 512 entries)
-                                                        └─[idx]─► PTE: frame no. + flags
-```
-
-9 + 9 + 9 + 9 + 12 = 48. Each level's table is exactly one page (512 entries × 8 bytes = 4096 B), which is elegant: page tables are themselves stored in pages.
-
-**Why a tree beats an array:** a process that uses 1 MiB of memory needs one PML4, one PDPT, one PD, and one PT — **four pages, 16 KiB total** — to describe it. Unused regions have a null entry at a high level and cost *zero* pages below. The tree is sparse; the address space is mostly holes.
-
-**`CR3`** is a CPU register holding the physical address of the current process's top-level table. **A context switch to another process is, at its heart, writing a new value into CR3.** That single write swaps the entire meaning of every address in the machine. Sit with that for a second — it is the most leveraged instruction in the system.
-
-### Worked example — translate one address by hand
-
-Take VA `0x00007F1A2B3C4D5E`. Binary, grouped by field:
-
-```
-0x00007F1A2B3C4D5E
-= 0000 0000 0000 0000 0111 1111 0001 1010 0010 1011 0011 1100 0100 1101 0101 1110
-
-bits 47–39 (PML4 index) = 0 1111 1110   = 0xFE  = 254
-bits 38–30 (PDPT index) = 0 0110 1000   = 0x68  = 104
-bits 29–21 (PD   index) = 1 0101 1001   = 0x159 = 345
-bits 20–12 (PT   index) = 1 1110 0100   = 0x1E4 = 484
-bits 11–0  (offset)     = 1101 0101 1110 = 0xD5E = 3422
-```
-
-The MMU then does a **page-table walk**:
-
-| Step | Read | From physical address | Yields |
-|---|---|---|---|
-| 1 | PML4[254] | `CR3 + 254×8` | phys addr of a PDPT |
-| 2 | PDPT[104] | `PDPT_base + 104×8` | phys addr of a PD |
-| 3 | PD[345] | `PD_base + 345×8` | phys addr of a PT |
-| 4 | PT[484] | `PT_base + 484×8` | **PTE**: frame `0x1B7A2`, flags `present, writable, user, accessed` |
-| 5 | combine | `0x1B7A2 × 4096 + 3422` = `0x1B7A2D5E` | the physical address |
-
-**Count the cost: four memory reads to service one memory read.** Every load and store, 5× the traffic. That would make the machine roughly 5× slower — which is exactly why the next section exists.
-
-Each **PTE** (page table entry) is 8 bytes: ~40 bits of frame number plus flags that carry an enormous amount of the OS's policy:
-
-| Flag | Meaning | Who uses it and for what |
-|---|---|---|
-| `P` (present) | mapping is valid *right now* | Cleared ⇒ access traps to the kernel. This one bit is the hook for demand paging, swap, and mmap'd files. |
-| `R/W` | writable | Cleared on a writable page ⇒ **copy-on-write** trap (§2.5) |
-| `U/S` | user-accessible | Cleared on kernel pages; the hardware boundary of privilege |
-| `A` (accessed) | CPU sets on any access | The kernel reads and clears it to find cold pages for eviction |
-| `D` (dirty) | CPU sets on write | Clean page ⇒ can be dropped for free; dirty ⇒ must be written out first |
-| `NX` | no-execute | Makes a data page non-executable — the mitigation that killed the simplest stack-smashing exploits |
-
-### 2.1 The TLB — making translation nearly free
+## 1.1 Virtual memory — the illusion that every process owns all of RAM
 
 **Depth: [CORE]**
 
-A four-read walk per access is intolerable, so the MMU caches recent translations in the **TLB** (Translation Lookaside Buffer): a small, very fast, fully-associative-ish cache keyed by virtual page number, valued by PTE.
+### Intuition
 
-- **TLB hit:** translation in ~1 cycle, effectively free. Hit rates in normal code are >99%.
-- **TLB miss:** do the four-level walk (the intermediate levels are themselves cached in the CPU's data caches, so a miss is usually tens of cycles, not four full DRAM round-trips).
+Run two Python programs at once. Both can print a pointer-ish address near `0x7fff…` for their stack, or malloc something and see it land at, say, address `0x55e4…`. If both processes literally used the same physical RAM addresses, they would instantly corrupt each other — process A's write to `0x55e4…` would clobber process B's data. They don't. **Each process gets its own private map of addresses — a virtual address space — and the same virtual address in two processes points at completely different physical RAM.**
 
-Sizes are microarchitecture-specific and worth measuring rather than memorizing: recent x86 cores have on the order of 64 entries in the L1 data TLB and one to two thousand in a shared L2 TLB. **Verify against your CPU's optimization manual — these numbers change every generation.**
+That is virtual memory: **a layer of indirection between the addresses a program uses (virtual) and the actual RAM cells (physical).** Every memory access your program makes goes through a hardware translation — virtual address → physical address — performed by the CPU's **MMU** (Memory Management Unit) using tables the OS maintains. The program never sees, and cannot name, a physical address at all.
 
-Do the arithmetic that matters: **64 L1-dTLB entries × 4 KiB = 256 KiB of "TLB reach."** Walk a 4 GiB array and you will miss the TLB constantly regardless of how good your data-cache locality is. This is the real reason huge pages exist: 64 entries × 2 MiB = 128 MiB of reach, a 512× improvement, for workloads (databases, JVM heaps, LLM weights) that stride over gigabytes.
+**Why virtual memory exists / what came before.** In the earliest systems, programs used physical addresses directly. Three disasters followed, and virtual memory solves all three at once:
 
-**Analogy — the TLB is the sticky note on your monitor.** The full phone directory (page tables) is in a drawer; the six numbers you actually call are on a sticky note. **Where it breaks:** a sticky note is written by *you*, deliberately. TLB entries are filled automatically as a side effect of access, and — critically — **the kernel must explicitly invalidate them when it changes a mapping**, or the CPU will keep happily using a stale translation to a page that now belongs to someone else. That invalidation (`INVLPG`, or a full flush on CR3 write, or a *TLB shootdown*: an inter-processor interrupt telling every other core to flush too) is one of the genuinely expensive operations in an OS. There is no sticky-note analogue for "I must interrupt all my colleagues to tell them to throw away their notes."
+1. **No isolation.** Any program could read or write any other program's memory (and the OS's), by accident or malice. Virtual memory gives each process a *separate* address space — process A literally *cannot express* an address that lands in process B's RAM. This is the enforcement mechanism behind Day 2's process isolation and Day 3's "one thread crash takes the process, but not other processes."
+2. **No relocation / fragmentation hell.** A program compiled to load at physical address `0x1000` couldn't run if another program was already there. With virtual memory, every program can *believe* it starts at the same virtual address; the OS maps those identical virtual addresses to whatever physical pages happen to be free — scattered all over RAM — and the program is none the wiser.
+3. **No overcommit / demand loading.** Physical RAM is finite (say 16 GB), but a process can have a *virtual* address space far larger (48 bits ≈ 256 TB on x86-64) and allocate more than physically exists, because the OS only hands out real RAM for the parts you actually *touch* (§1.3, demand paging), and can spill cold parts to disk (swap). "Allocate 10 GB" costs almost nothing until you write to it.
 
-### 2.2 Page faults: the mechanism the whole design hangs on
+The single sentence: **virtual memory decouples what a program asks for from what physically exists, and that decoupling buys isolation, relocation, and lazy/over-allocation all at once.**
 
-**Depth: [CORE]**
+### Analogy — hotel room numbers vs the building's physical rooms
 
-A **page fault** is a CPU exception raised when a virtual address cannot be translated with the current tables — either `P=0`, or the access violates a flag (writing a read-only page, user code touching a kernel page, executing an `NX` page).
+A hotel gives every *guest* (process) their own booklet numbering "your rooms" 1, 2, 3, … Guest A's "room 5" and guest B's "room 5" are physically different rooms in the building; the front desk (the OS/MMU) keeps a private lookup table per guest mapping *their* room 5 to an actual physical room (say, 512 for A, 907 for B). Guests never learn the real room numbers, so guest A can't wander into guest B's room even if they wanted to — A can only say "my room 5," and the desk sends them to 512. The hotel can also promise each guest "a thousand rooms" while owning only 300 physical rooms, because guests rarely occupy more than a few at once (overcommit), and can move a guest's rarely-used luggage into the basement storeroom (swap) to free a room.
 
-**What physically happens, in order** (this is the "under the hood" the syllabus asks for):
+**Where the analogy breaks (non-negotiable to state):** two ways.
+1. **The translation is per-access and hardware-fast, not a front-desk phone call.** Every single memory read/write is translated by the MMU in a few *nanoseconds*, cached in the TLB (§1.2). If it were as slow as asking a receptionist, programs would run millions of times slower. The analogy makes translation feel like an occasional lookup; in reality it happens *billions of times per second*, which is exactly why the TLB exists and why TLB misses matter (§1.2).
+2. **Rooms are all-or-nothing; pages are uniform and shareable.** The hotel maps whole rooms of arbitrary size; the MMU maps fixed **4 KB pages** (§1.2), and — the part with no hotel equivalent — two guests' booklets can point *the same* physical page (shared read-only code, or copy-on-write after `fork`, Day 2). "Two different guests, same physical room, and it's fine because nobody writes" has no clean hotel analog, yet it is the mechanism behind shared libraries and the Instagram CoW case study (§1.9).
 
-1. The MMU fails the translation mid-instruction.
-2. The CPU **does not retire the instruction**. It saves the faulting virtual address into control register `CR2`, pushes an error code (was it a write? a user access? a protection violation vs a missing page?), and vectors to interrupt 14 — the page-fault handler — switching to kernel mode.
-3. Linux's `do_page_fault()` looks up which **VMA** (Virtual Memory Area — a kernel record describing one contiguous mapped region: its address range, permissions, and backing store) contains `CR2`.
-4. Now it decides which *kind* of fault this is:
+### Worked example — a huge virtual allocation that costs almost no physical RAM
 
-| Kind | Condition | Kernel action | Cost |
-|---|---|---|---|
-| **Minor fault** (a.k.a. soft) | Page needed, but data is already in RAM or needs no data | Point a PTE at an existing/zeroed frame, set `P=1` | ~0.1–2 µs |
-| ↳ *anonymous first touch* | First write to newly `mmap`'d memory | Grab a free frame, **zero it**, install PTE | dominated by the zeroing |
-| ↳ *page-cache hit* | File page already cached from an earlier read | Install PTE pointing at the existing page-cache frame | very cheap |
-| ↳ *copy-on-write* | Write to a page shared read-only after `fork()` | Allocate a frame, **copy 4 KiB**, install writable PTE | ~1 µs (a memcpy) |
-| **Major fault** (a.k.a. hard) | Data must come from a storage device | Issue I/O, **block the thread**, sleep, install PTE on completion | NVMe ~50–150 µs; spinning disk ~5–10 ms |
-| ↳ *file-backed read* | First touch of an `mmap`'d file / demand-paged executable | read from filesystem | |
-| ↳ *swap-in* | Page was evicted to swap | read from swap device | |
-| **Invalid** | No VMA, or permission genuinely violated | Deliver `SIGSEGV` → your process dies with "Segmentation fault" | |
+Allocate a **1 GB** anonymous memory region. Measure the process's *virtual* size (`VmSize`) and *resident* size (`VmRSS` — physical RAM actually used) before touching it, after touching one page, and after touching all of it.
 
-5. On success the kernel returns from the interrupt and **the CPU re-executes the exact same instruction**, which now succeeds.
+```
+   step                         VmSize (virtual)   VmRSS (physical, resident)
+   ────────────────────────────────────────────────────────────────────────
+   after mmap(1 GB)             +1024 MB           +0.0 MB     ← promised, not delivered
+   after touching 1 page (4 KB) +1024 MB           +0.004 MB   ← one page faulted in
+   after touching every page    +1024 MB           +1024 MB    ← now it's really resident
+```
 
-Two consequences worth internalizing:
+The gap between `VmSize` (what you *asked for*) and `VmRSS` (what you *physically use*) is the whole point: **virtual memory is a promise; physical RAM is delivered lazily, one page at a time, only when you touch it** (§1.3). This is why `top`/`htop` show a "VIRT" column far larger than "RES" for almost every process — the virtual number is mostly unbacked promises.
 
-- **A minor fault costs microseconds; a major fault costs 100–10,000× more.** Your minor-fault count tells you about allocation churn; your major-fault count tells you whether you are quietly reading from disk. They are completely different problems and you must never look at one number called "page faults."
-- **A major fault blocks the thread with no visible I/O call.** `arr[500000] = 1` can take 8 ms. In an `async` server that is a hidden blocking call that no `await` marks and no profiler attributes to I/O. This is the memory-side twin of the blocking-call trap you'd otherwise only associate with `requests.get()` inside `async def`.
-
-### Runnable example — virtual size is a promise; RSS is the bill
-
-Shows the single most important practical consequence of demand paging: reserving 1 GiB costs almost nothing until you touch it.
+### Runnable example — proving virtual ≫ resident, and demand paging in action
 
 ```python
-# lazy_alloc.py — virtual address space is free; physical pages are not.
-# pip install psutil
-# Linux/macOS/WSL: exact behaviour as described. Windows: see note below.
-import mmap
-import os
-import psutil
+# virt_vs_res.py — Linux. stdlib only (uses /proc and mmap).
+# Run:  python3 virt_vs_res.py
+import mmap, os
 
-proc = psutil.Process(os.getpid())
-PAGE = mmap.PAGESIZE  # 4096 on x86-64 Linux
+PAGE = os.sysconf("SC_PAGE_SIZE")          # 4096 on x86-64 (verify: getconf PAGE_SIZE)
 
-
-def report(label: str) -> None:
-    m = proc.memory_info()
-    print(f"{label:<34} VMS(virtual)={m.vms / 2**20:9.1f} MiB   RSS(resident)={m.rss / 2**20:8.1f} MiB")
-
-
-report("1. baseline")
-
-# Ask the kernel for 1 GiB of anonymous memory. No file, no data, no zeroing yet.
-region = mmap.mmap(-1, 1024 * 2**20)
-report("2. after mmap of 1 GiB")
-
-# Touch one byte in each of the first 10,000 pages => 10,000 minor faults.
-for page_index in range(10_000):
-    region[page_index * PAGE] = 1
-report("3. after touching 10,000 pages")
-
-# Touch one byte in every page of the whole 1 GiB => 262,144 minor faults.
-for offset in range(0, len(region), PAGE):
-    region[offset] = 1
-report("4. after touching all 262,144 pages")
-
-region.close()
-report("5. after munmap")
-print(f"\npage size = {PAGE} B; 10,000 pages = {10_000 * PAGE / 2**20:.1f} MiB")
-```
-
-Invocation and output (one run, CPython 3.11 on Linux x86-64 — **your absolute numbers will differ; the shape is the lesson**):
-
-```console
-$ python lazy_alloc.py
-1. baseline                        VMS(virtual)=     19.8 MiB   RSS(resident)=    13.2 MiB
-2. after mmap of 1 GiB             VMS(virtual)=   1043.8 MiB   RSS(resident)=    13.2 MiB
-3. after touching 10,000 pages     VMS(virtual)=   1043.8 MiB   RSS(resident)=    52.3 MiB
-4. after touching all 262,144 pages VMS(virtual)=  1043.8 MiB   RSS(resident)=  1037.3 MiB
-5. after munmap                    VMS(virtual)=     19.8 MiB   RSS(resident)=    13.3 MiB
-
-page size = 4096 B; 10,000 pages = 39.1 MiB
-```
-
-**Why this works, line by line.**
-
-- `mmap.mmap(-1, N)` asks the kernel for an **anonymous mapping**: `-1` means "not backed by a file." The kernel's entire job here is to add one VMA record — a range, `PROT_READ|PROT_WRITE`, anonymous — to a tree. It allocates **zero** physical frames. That is why line 2 shows VMS jump by 1024 MiB and RSS not move at all. *VMS is a promise the kernel made; RSS is the part it has paid.*
-- Why not `bytearray(1<<30)`? Because CPython `memset`s a `bytearray` to zero on construction, which touches every page and destroys the demonstration. Choosing `mmap` here is not stylistic — it's required for the effect to be visible.
-- Line 3: 10,000 stores, each to a fresh page, each trapping a **minor fault** where the kernel grabs a free frame, zeroes it, and installs a PTE. RSS rises by ~39 MiB = exactly 10,000 × 4 KiB. **You can read the page size straight off the measurement.**
-- Line 4: the remaining 252,144 pages fault in. RSS ≈ 1 GiB. Only *now* has the promise been paid.
-- Line 5: `close()` unmaps the VMA; both counters return to baseline. Note that RSS returned fully here — because this was a whole-VMA `munmap`, not a `free()`. Remember this when you get to §4 and §6.6, where freeing does *not* return RSS.
-
-**Honesty note (Windows).** On Windows there is no `mmap` of `-1` in the POSIX sense; Python maps a pagefile-backed section, and `psutil` reports `vms` as pagefile commit and `rss` as the working set. You will see a broadly similar reserve-then-pay pattern, but Windows distinguishes *reserved* from *committed* address space explicitly (`VirtualAlloc` with `MEM_RESERVE` vs `MEM_COMMIT`), and by default this mapping is committed up front, so the numbers may not match the table above. Run it under WSL2 to see the Linux semantics this note describes.
-
-### Runnable example — counting minor vs major faults, and feeling the difference
-
-```python
-# fault_counter.py — minor faults are cheap; major faults are disk.
-# Linux/macOS only (uses the POSIX `resource` module). On Windows use WSL2.
-import mmap
-import os
-import resource
-import time
-
-MiB = 2**20
-
-
-def faults() -> tuple[int, int]:
-    r = resource.getrusage(resource.RUSAGE_SELF)
-    return r.ru_minflt, r.ru_majflt  # cumulative for this process
-
-
-def show(label: str, before: tuple[int, int], elapsed: float) -> None:
-    after = faults()
-    print(
-        f"{label:<28} minor=+{after[0] - before[0]:>7}  major=+{after[1] - before[1]:>5}"
-        f"  wall={elapsed * 1e3:8.2f} ms"
-    )
-
-
-# --- A: anonymous memory (minor faults only) -------------------------------
-region = mmap.mmap(-1, 256 * MiB)
-b = faults()
-t = time.perf_counter()
-for off in range(0, len(region), mmap.PAGESIZE):
-    region[off] = 1
-show("A. touch 256 MiB anon", b, time.perf_counter() - t)
-region.close()
-
-# --- B: a file we just wrote (in page cache => still minor faults) ---------
-path = "/tmp/faultdemo.bin"
-with open(path, "wb") as f:
-    f.write(b"\x00" * (256 * MiB))
-    f.flush()
-    os.fsync(f.fileno())
-
-with open(path, "rb") as f:
-    mapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    b = faults()
-    t = time.perf_counter()
-    total = 0
-    for off in range(0, len(mapped), mmap.PAGESIZE):
-        total += mapped[off]
-    show("B. read 256 MiB (cached)", b, time.perf_counter() - t)
-    mapped.close()
-
-# --- C: same file with the page cache dropped => major faults --------------
-# Requires root. Without it, C will look like B and that is itself informative.
-try:
-    os.sync()
-    with open("/proc/sys/vm/drop_caches", "w") as f:
-        f.write("3")
-    dropped = True
-except (PermissionError, FileNotFoundError):
-    dropped = False
-
-with open(path, "rb") as f:
-    mapped = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-    b = faults()
-    t = time.perf_counter()
-    total = 0
-    for off in range(0, len(mapped), mmap.PAGESIZE):
-        total += mapped[off]
-    show(f"C. read 256 MiB (cache {'dropped' if dropped else 'NOT dropped'})", b, time.perf_counter() - t)
-    mapped.close()
-
-os.unlink(path)
-```
-
-Output (one run; a laptop NVMe, run as root so step C could drop caches):
-
-```console
-$ sudo python fault_counter.py
-A. touch 256 MiB anon        minor=+  65563  major=+    0  wall=  118.44 ms
-B. read 256 MiB (cached)     minor=+  65546  major=+    0  wall=   96.71 ms
-C. read 256 MiB (cache dropped) minor=+   2072  major=+ 1029  wall=  842.36 ms
-```
-
-**Why this works.**
-
-- `resource.getrusage(RUSAGE_SELF)` reads the kernel's per-process counters `ru_minflt` and `ru_majflt`. These are *the* ground truth for "did this workload go to disk." No sampling, no estimation.
-- **A** produces ~65,536 minor faults = 256 MiB ÷ 4 KiB, exactly one per page, and zero major faults. There is nothing to read; the kernel is just handing out zeroed frames.
-- **B** produces the same minor count and still **zero major faults** — because we wrote the file seconds ago and it is entirely in the **page cache** (the kernel's cache of file contents in RAM). Mapping and reading a cached file costs only PTE installation. *This is the single most misunderstood thing about file I/O: a "disk read" of a hot file never touches the disk.*
-- **C** is where the design shows itself. After `drop_caches`, the pages are gone from RAM, so ~1029 major faults appear and wall time rises 8×. Notice the *shape*: only ~1000 major faults for 65,536 pages, because Linux does **readahead** — one fault triggers a multi-page (here ~64-page) read, so subsequent pages in the run arrive already present. Readahead is why sequential access to a cold file is bearable and random access to one is not.
-- If you can't run as root, C looks like B. That output is honest and still teaches: it tells you the cache was warm.
-
-### 2.3 Swap: using disk as slow RAM
-
-**Depth: [WORKING]**
-
-When free frames run low, the kernel must reclaim some. It has two classes of victim:
-
-- **Clean file-backed pages** (program text, `mmap`'d files, page cache): the data also exists on disk, so the kernel simply drops the frame. **Free.**
-- **Anonymous pages** (your heap, your stack): there is no on-disk copy. To reclaim them the kernel must first write them to a **swap** area (a partition or file). That write is the cost.
-
-**Swap is not "extra RAM"; it is a policy for which pages get demoted to 100 µs–10 ms access latency.** `/proc/sys/vm/swappiness` (0–200, default 60) biases the choice between evicting file pages and swapping anonymous pages. Higher = more willing to swap anonymous memory.
-
-**Thrashing** is the failure mode: the working set (the pages actually being used in the current time window) exceeds RAM, so every page you swap in evicts one you're about to need. Progress collapses; the CPU sits at low utilization while the disk saturates. A thrashing machine often *looks* idle in CPU graphs and is completely unusable. Watch `si`/`so` columns in `vmstat 1` and `ru_majflt`.
-
-**Kubernetes note.** Historically the kubelet refused to start on a node with swap enabled (`failSwapOn`), because swap makes memory limits unenforceable in a way schedulers can't reason about: a pod "under its limit" could be pathologically slow. Swap support has been progressing through feature gates in recent releases — **verify against the Kubernetes version you actually run; this is a fast-moving area.** The operational default in most clusters today is still: no swap, and an over-limit pod is killed rather than slowed.
-
-### 2.4 `mmap`: the same machinery, exposed to you
-
-**Depth: [WORKING]**
-
-`mmap` maps a range of virtual addresses to a backing store and lets you access a file (or nothing) as if it were an array.
-
-```
-read() path                          mmap() path
------------                          -----------
-open + read(fd, buf, n)              mmap(fd, n) then touch memory
-kernel reads into page cache         kernel reads into page cache
-kernel COPIES into your buffer  <──  no copy: your PTEs point AT the page cache
-2 copies of the data in RAM          1 copy, shared with every other mapper
-```
-
-Why it matters far beyond file I/O:
-- **Shared libraries.** `libc.so` is `mmap`'d read-only by every process on the machine, all pointing at the *same* physical frames. One copy of libc in RAM, hundreds of users. If each process had its own copy, a typical Linux box would need many GiB more RAM.
-- **Model weights.** `safetensors` and `llama.cpp` load weights via `mmap` precisely so that (a) startup doesn't block on reading 16 GiB, (b) pages load on demand, and (c) N processes serving the same model share one physical copy. Part 2 returns to this.
-- **The trap:** with `mmap`, an out-of-memory condition doesn't come back as a `NULL` from `read()` — it comes back as a **`SIGBUS`** or a major fault storm deep inside what looks like an array index. It moves error handling from a place you check to a place you don't.
-
-### 2.5 Copy-on-write: how `fork()` is fast
-
-**Depth: [CORE]** — this is the mechanism behind the Instagram case study, behind Gunicorn's `--preload`, and behind Redis's most famous latency footgun.
-
-`fork()` creates a child process that is a duplicate of the parent. Copying a 2 GiB parent's memory would take ~1 second and double RAM. Instead:
-
-1. The kernel copies only the **page tables**, not the pages.
-2. Every writable page in *both* processes is marked **read-only** in the PTE, and the underlying frame's reference count is incremented.
-3. Reads in either process hit shared frames. **Zero copies. Zero extra RAM.**
-4. The first *write* to such a page raises a protection fault. The kernel sees "this VMA is writable but the PTE is not, and refcount > 1," allocates a fresh frame, **copies the 4 KiB**, points the writer's PTE at the copy, and marks it writable.
-5. The instruction re-executes and succeeds.
-
-**Consequence with teeth: memory is shared until touched, and the granularity of "touched" is a whole 4 KiB page.** Writing one byte privatizes 4096. And here is the part that catches every Python team eventually: **a pure read in Python is a write in memory.** `x = some_shared_list[0]` increments the refcount of the object, and the refcount lives *inside the object*, on a shared page. Merely reading a data structure privatizes its pages, one 4 KiB page at a time, until nothing is shared. That single sentence is the whole Instagram case study (§9.1).
-
-### Runnable example — watching CoW privatize pages, and Python defeating it
-
-```python
-# cow_demo.py — fork() shares memory until you touch it; Python touches it by reading.
-# Linux only (needs fork() and /proc/<pid>/smaps_rollup). Run under WSL2 on Windows.
-import os
-import sys
-import time
-
-MiB = 2**20
-
-
-def smaps_rollup(pid: int) -> dict[str, int]:
-    """Per-process memory breakdown in KiB, straight from the kernel."""
-    out: dict[str, int] = {}
-    with open(f"/proc/{pid}/smaps_rollup") as f:
+def mem_mb():
+    """Return (VmSize, VmRSS) in MB from /proc/self/status (Linux)."""
+    vsz = rss = 0.0
+    with open("/proc/self/status") as f:
         for line in f:
-            if ":" in line and line.strip().endswith("kB"):
-                key, val = line.split(":", 1)
-                out[key.strip()] = int(val.split()[0])
-    return out
+            if line.startswith("VmSize:"): vsz = int(line.split()[1]) / 1024
+            if line.startswith("VmRSS:"):  rss = int(line.split()[1]) / 1024
+    return vsz, rss
 
+SIZE = 1024 * 1024 * 1024                    # 1 GiB
+print(f"page size = {PAGE} bytes")
+print(f"start                : VmSize={mem_mb()[0]:8.1f} MB  VmRSS={mem_mb()[1]:8.1f} MB")
 
-def report(tag: str) -> None:
-    s = smaps_rollup(os.getpid())
-    shared = s.get("Shared_Clean", 0) + s.get("Shared_Dirty", 0)
-    private = s.get("Private_Clean", 0) + s.get("Private_Dirty", 0)
-    print(
-        f"[pid {os.getpid():>7} {tag:<16}] Rss={s['Rss'] / 1024:7.1f} MiB   "
-        f"Shared={shared / 1024:7.1f} MiB   Private={private / 1024:7.1f} MiB",
-        flush=True,
-    )
+# Anonymous mapping: 1 GB of virtual address space, backed by NOTHING yet.
+buf = mmap.mmap(-1, SIZE)                    # -1 fd = anonymous (not a file)
+print(f"after mmap(1 GB)     : VmSize={mem_mb()[0]:8.1f} MB  VmRSS={mem_mb()[1]:8.1f} MB  <- virtual jumped, resident did NOT")
 
+buf[0] = 1                                   # touch ONE byte -> faults in ONE page
+print(f"after touching 1 page: VmSize={mem_mb()[0]:8.1f} MB  VmRSS={mem_mb()[1]:8.1f} MB  <- +one page resident")
 
-# Build ~200 MiB of real Python objects in the parent BEFORE forking.
-data = [[i, i + 1, i + 2] for i in range(700_000)]
-print(f"parent built {len(data):,} lists")
-report("parent, pre-fork")
+for off in range(0, SIZE, PAGE):             # touch every page -> fault them all in
+    buf[off] = 1
+print(f"after touching ALL   : VmSize={mem_mb()[0]:8.1f} MB  VmRSS={mem_mb()[1]:8.1f} MB  <- now physically resident")
 
-pid = os.fork()
-
-if pid == 0:  # ---------------- child ----------------
-    time.sleep(0.3)
-    report("child, no touch")
-
-    # Pure "read" of 200k elements. We never assign to `data`.
-    total = 0
-    for row in data[:200_000]:
-        total += row[0]
-    report("child, after READ")
-    sys.stdout.flush()
-    os._exit(0)
-
-else:  # ---------------- parent ----------------
-    os.waitpid(pid, 0)
-    report("parent, post-fork")
+buf.close()
 ```
 
-Output (one run, CPython 3.11 / Linux 6.x):
+Actual output (a 4-core Linux box with plenty of RAM; your exact numbers vary):
 
-```console
-$ python cow_demo.py
-parent built 700,000 lists
-[pid  184213 parent, pre-fork ] Rss=  241.6 MiB   Shared=    5.8 MiB   Private=  235.8 MiB
-[pid  184219 child, no touch  ] Rss=  241.7 MiB   Shared=  236.0 MiB   Private=    5.7 MiB
-[pid  184219 child, after READ] Rss=  241.8 MiB   Shared=  158.4 MiB   Private=   83.4 MiB
-[pid  184213 parent, post-fork] Rss=  241.6 MiB   Shared=  158.3 MiB   Private=   83.3 MiB
+```
+# -> page size = 4096 bytes
+# -> start                : VmSize=    28.7 MB  VmRSS=    12.4 MB
+# -> after mmap(1 GB)     : VmSize=  1052.7 MB  VmRSS=    12.4 MB  <- virtual jumped, resident did NOT
+# -> after touching 1 page: VmSize=  1052.7 MB  VmRSS=    12.4 MB  <- +one page resident
+# -> after touching ALL   : VmSize=  1052.7 MB  VmRSS=  1036.5 MB  <- now physically resident
 ```
 
 **Why this works, line by line.**
 
-- `/proc/<pid>/smaps_rollup` is the kernel's own accounting, split into `Shared_*` (frames whose refcount > 1 — i.e. genuinely co-owned) and `Private_*` (this process alone). This is the only honest way to see CoW; plain RSS *double-counts* shared pages and would show you nothing.
-- **`child, no touch`:** RSS is 241 MiB but ~236 MiB of it is **shared**. The child "has" 241 MiB while adding almost nothing to the machine's real usage. If you sum RSS across a pre-forked worker pool you will massively overcount — this is precisely the mistake behind "my 8 workers use 2 GiB each so I need 16 GiB."
-- **`child, after READ`:** we only *read*. Yet 78 MiB moved from Shared to Private. Every `row[0]` and every loop step incremented and decremented refcounts stored inside the list objects, dirtying their pages. **The read privatized them.** Note both processes now report the reduced Shared figure — sharing is a property of the frame, not of one process.
-- The `os._exit(0)` in the child (not `sys.exit`) avoids running the parent's `atexit` handlers and buffered-output flush twice — a small correctness detail that bites people writing fork demos.
+- `mmap.mmap(-1, SIZE)` with fd `-1` asks the kernel for a **1 GB anonymous mapping** — a range of *virtual* addresses, backed by zero physical pages. The kernel just records the promise in the process's page tables (§1.2) marked "demand-zero." `VmSize` jumps by ~1 GB; `VmRSS` (physical) does **not move**. That gap is the illusion of §1.1: you "have" a gigabyte you don't physically occupy.
+- `buf[0] = 1` writes one byte. The CPU tries to translate that virtual address, finds no physical page mapped → a **page fault** (§1.3) → the kernel allocates *one* physical 4 KB page, zeroes it, maps it, and resumes. `VmRSS` rises by ~4 KB (rounding hides it in the MB display; on some runs you'll see +0.0 because it's below display precision — the *ALL* step is the unmistakable proof).
+- The loop touches one byte per page across the whole gigabyte, forcing a page fault per page, and *now* `VmRSS` climbs to ~1 GB — the physical RAM was delivered lazily, page by page, exactly as demanded. **This is demand paging (§1.3) made visible.** If you had `SIZE = 100 GB` on a 16 GB machine, the `mmap` would still succeed (overcommit) and only crash when you *touched* more than physical RAM + swap could hold — the OOM killer (§1.5) fires on *use*, not on *request*.
+- **Honesty caveat:** `/proc/self/status` `VmRSS` counts pages resident *for this process*; shared pages are counted too, so it's an over-estimate of "private" memory. For precise accounting use `smaps_rollup` (`Pss` = proportional set size, which splits shared pages fairly). `VmRSS` is the right first tool; `Pss` is the honest one when pages are shared (§1.9's CoW story).
 
-**Honesty note:** exact numbers depend on CPython version (object layouts changed), kernel version, and whether transparent huge pages are enabled — with THP on, a single write can privatize **2 MiB**, not 4 KiB, and the Private column jumps far faster. That THP interaction is a real production incident generator; see §9.3.
+**Under the hood.** The kernel represents each mapping as a **VMA** (virtual memory area — a `vm_area_struct`: start, end, permissions, backing). `mmap` just adds a VMA; no page tables are filled yet. On first touch, the CPU raises a page fault, the kernel's fault handler consults the VMA, sees "anonymous, demand-zero," grabs a free physical frame from the buddy allocator, zeroes it (security: you must never see another process's old data), installs the mapping in the page table, and retries the instruction. Linux **overcommits** by default (`vm.overcommit_memory=0`, heuristic) — it says yes to allocations exceeding RAM+swap, betting you won't touch it all; the bet is settled by the OOM killer (§1.5). Primary sources: `mmap(2)`, `proc(5)` (the `/proc/[pid]/status` and `smaps` fields), `Documentation/vm/overcommit-accounting` in the Linux tree.
 
-### 2.6 The address space, laid out
-
-```
-0xFFFFFFFFFFFFFFFF ┌──────────────────────────────┐
-                   │   kernel space (128 TiB)      │  same physical mapping in
-                   │   not accessible from user    │  every process (U/S=0)
-0xFFFF800000000000 ├──────────────────────────────┤
-                   │        non-canonical hole      │  faults immediately
-0x00007FFFFFFFFFFF ├──────────────────────────────┤
-                   │  [stack]      grows DOWN  ↓   │  8 MiB default (ulimit -s)
-                   ├──────────────────────────────┤
-                   │  mmap region  grows DOWN  ↓   │  shared libs, big malloc,
-                   │                               │  thread stacks, file maps
-                   │            . . .              │
-                   │                               │
-                   │  [heap]       grows UP    ↑   │  brk/sbrk; small malloc
-                   ├──────────────────────────────┤
-                   │  .bss    (zero-init globals)  │
-                   │  .data   (init globals)       │
-                   │  .rodata (constants)          │  read-only
-                   │  .text   (machine code)       │  read-only + executable
-0x0000000000400000 ├──────────────────────────────┤
-                   │  guard page — NULL deref traps│
-0x0000000000000000 └──────────────────────────────┘
-```
-
-You can read your own, exactly:
-
-```console
-$ python -c "print(open('/proc/self/maps').read())" | head -12
-560f4e4b7000-560f4e4b8000 r--p 00000000 08:20 1049171   /usr/bin/python3.11
-560f4e4b8000-560f4e4ba000 r-xp 00001000 08:20 1049171   /usr/bin/python3.11
-560f4e4ba000-560f4e4bb000 r--p 00003000 08:20 1049171   /usr/bin/python3.11
-560f4e4bb000-560f4e4bc000 r--p 00003000 08:20 1049171   /usr/bin/python3.11
-560f4e4bc000-560f4e4bd000 rw-p 00004000 08:20 1049171   /usr/bin/python3.11
-560f4f1a2000-560f4f4c9000 rw-p 00000000 00:00 0         [heap]
-7f2a4c000000-7f2a4c021000 rw-p 00000000 00:00 0
-7f2a54c1f000-7f2a54c22000 r--p 00000000 08:20 1049416   /usr/lib/.../libz.so.1
-...
-7ffd4c2a0000-7ffd4c2c1000 rw-p 00000000 00:00 0         [stack]
-```
-
-Read the columns: address range, permissions (`r`ead `w`rite e`x`ecute, `p`rivate or `s`hared), file offset, device, inode, path. Note the four separate mappings of the python binary with different permissions — the linker splits the file so code can be `r-xp` (executable, never writable) and data `rw-p` (writable, never executable). **Writable-and-executable is the property exploits need; the loader's job is to ensure no mapping has both.**
-
-### 2.7 Huge pages
-
-**Depth: [AWARE]**
-
-x86-64 lets a PD entry map a 2 MiB region directly (skipping the last level) and a PDPT entry map 1 GiB. Benefits: 512× TLB reach, one less walk level. Costs: 2 MiB minimum granularity means internal waste, and the kernel must find 2 MiB of *physically contiguous* free memory, which fragmentation makes hard.
-
-Two flavors: **explicit** hugepages (reserved pool, requested via `mmap(MAP_HUGETLB)` — how databases and DPDK do it) and **Transparent Huge Pages / THP** (the kernel silently promotes eligible regions, controlled by `/sys/kernel/mm/transparent_hugepage/enabled`).
-
-**Treat this as a black box unless a project forces you deeper** — but know one thing, because it's a recurring outage: THP interacts badly with `fork()`-heavy and latency-sensitive workloads. Redis's own documentation recommends disabling THP because during a `fork()`-based background save, a single write privatizes 2 MiB instead of 4 KiB, inflating memory use and adding latency spikes. Same reasoning applies to any pre-fork worker pool. See §9.3.
+**Deliberate stop.** I am not opening the buddy allocator or the slab allocator (how the kernel manages *its own* free physical frames) — you now know the shape (virtual VMAs, physical frames handed out on fault) precisely enough for everything today. The page-table structure itself is §1.2.
 
 ---
 
-## 3. Stack vs heap
+## 1.2 Pages, page tables, and the TLB — how one address becomes another
 
 **Depth: [CORE]**
 
-Two regions, two lifetime disciplines, two failure modes. Confusing them is the source of an enormous share of beginner bugs and production surprises.
+### Intuition
 
-### Intuition — why there are two
+Virtual memory needs a *translation table*: for every virtual address a program uses, "which physical frame does it live in?" If the OS tracked this per-*byte*, the table would be as big as memory itself — absurd. So memory is chopped into fixed **pages** (4 KB on x86-64) and physical RAM into equal-sized **frames**, and the table maps *page → frame*, not byte → byte. A 64-bit virtual address splits into a **page number** (high bits — which page) and an **offset** (low 12 bits — which byte within the 4 KB page). Translation replaces the page number with a frame number and keeps the offset.
 
-Some data has a lifetime that is *exactly* a function call: arguments, local variables, where to return to. That lifetime is perfectly nested — if `f` calls `g`, `g`'s locals die before `f`'s. **Last in, first out.**
+The table that does this is the **page table**. Because a full flat table for a 48-bit space would be enormous, it's a **multi-level tree** (4 levels on x86-64: the CPU walks PML4 → PDPT → PD → PT), so only the branches you actually use consume space. Walking four levels of table *on every memory access* would be ruinously slow — so the CPU caches recent translations in the **TLB** (Translation Lookaside Buffer), a tiny associative cache of page→frame mappings. A **TLB hit** (the common case) translates in ~1 cycle; a **TLB miss** forces the multi-level page walk (~tens to 100+ cycles).
 
-When lifetimes are LIFO, you don't need a general allocator. You need a pointer. Allocation is "move the pointer down N bytes"; deallocation is "move it back." One instruction, no bookkeeping, no fragmentation, perfect cache locality (you keep reusing the same hot bytes).
+### Analogy — a book's index (chapter → page) plus a sticky-note shortlist
 
-Other data does *not* have that lifetime: a list built in one function and returned, a cache that outlives every request, an object referenced from two places. For that you need a region with arbitrary allocation and free order — the **heap** — and you pay for the flexibility with bookkeeping, fragmentation, and slower allocation.
+Finding a topic in a huge book: you don't scan every page. You use the **index** (topic → page number) — that's the page table (name → location). But flipping to the index every single time is slow, so you keep a few **sticky notes** on the topics you're looking up right now — that's the TLB. Hit a sticky note and you jump straight there; miss and you go back to the index (the page walk).
 
-### Analogy — the plate stack and the warehouse
+**Where the analogy breaks:** the book's index is one flat list; the page table is a **multi-level tree**, and — critically — the TLB is *tiny and finite* (typically dozens to a few thousand entries). A program that jumps randomly across a huge memory span "uses up" the sticky notes faster than they help, so its TLB miss rate soars and it stalls on page walks — the exact reason **random access is slower than sequential** beyond just cache effects (Day 1). The book analogy has no "you only get 64 sticky notes and jumping around thrashes them." That thrash is also why a **context switch** to a different *process* flushes the TLB (§1.3, Day 3 §1.5) — the new process's sticky notes are meaningless, so you start cold.
 
-The **stack** is a spring-loaded stack of plates in a cafeteria: you can only add or remove at the top, and finding the top is instant. The **heap** is a warehouse: any shelf, any size, any order, but you need an index of which shelves are free, and after enough churn you have plenty of total free space and nowhere to put a large pallet.
+### Worked example — decomposing a virtual address, and the cost of a miss
 
-**Where the analogy breaks:**
-1. **The cafeteria stack is unbounded; yours is 8 MiB and its overflow is often not an error but silent corruption.** Push past the end and you either hit a *guard page* (clean `SIGSEGV`) or, in adversarial conditions, walk into another mapping. There is no cafeteria event equivalent to "the plate you added quietly overwrote the floor plan."
-2. **The warehouse analogy suggests free space is fungible.** It isn't: 1000 non-contiguous free 1 KiB slots cannot host a 1 MiB request. Fragmentation has no good warehouse intuition because warehouse pallets can be *moved*, and C heap allocations cannot (their addresses are held by pointers).
-3. **Both analogies imply you choose.** In Python you essentially never choose: *everything* is on the heap (§6.1). The stack only holds frame bookkeeping and pointers.
-
-### What lives where, and when each is freed
-
-| | Stack | Heap |
-|---|---|---|
-| **Allocated by** | compiler-emitted `sub rsp, N` at function entry | explicit `malloc`/`new`; in Python, every object creation |
-| **Freed by** | `add rsp, N` / `leave` at return — **automatic, guaranteed** | explicit `free`; or GC; or refcount hitting zero |
-| **Freed when** | the function returns. Always. Even on exception (unwinding). | when the program (or runtime) says so — possibly never |
-| **Cost per alloc** | ~1 cycle | ~20–100 cycles typical, unbounded worst case |
-| **Size** | small and fixed: 8 MiB main thread on Linux (`ulimit -s`) | as large as the address space and RAM allow |
-| **Contents (C)** | locals, params beyond registers, return address, saved regs, spilled temporaries | anything with a lifetime not tied to a call |
-| **Contents (Python)** | `PyFrameObject` bookkeeping + *pointers* to objects | **every object**: ints, strings, lists, functions, classes |
-| **Fragmentation** | impossible (LIFO) | inherent |
-| **Thread safety** | one stack per thread, no sharing, no locks | shared; needs locks or per-thread arenas |
-| **Failure mode** | stack overflow → `SIGSEGV` or `RecursionError` | `MemoryError` / `NULL` / OOM kill |
-
-### Worked example — a stack frame, traced
-
-```c
-// frames.c — compile:  gcc -O0 -g frames.c -o frames
-long add(long a, long b) {      //  <-- frame 3
-    long sum = a + b;
-    return sum;
-}
-long compute(long n) {          //  <-- frame 2
-    long doubled = n * 2;
-    return add(doubled, 7);
-}
-int main(void) {                //  <-- frame 1
-    long result = compute(5);
-    return (int)result;
-}
-```
-
-At the moment `add` is executing `long sum = a + b`, the stack (growing downward) looks like:
+A virtual address `0x00007f3c_a01b_2064` on x86-64 with 4 KB pages:
 
 ```
-higher addresses
-  0x7ffd_4c2a_1f80  ┌─────────────────────────────┐
-                    │ main:    saved rbp          │  frame 1
-  0x7ffd_4c2a_1f78  │ main:    result  (= ?)      │
-  0x7ffd_4c2a_1f70  ├─────────────────────────────┤
-                    │ return address into main    │  <- pushed by `call compute`
-  0x7ffd_4c2a_1f68  │ compute: saved rbp          │  frame 2
-  0x7ffd_4c2a_1f60  │ compute: n       (= 5)      │
-  0x7ffd_4c2a_1f58  │ compute: doubled (= 10)     │
-  0x7ffd_4c2a_1f50  ├─────────────────────────────┤
-                    │ return address into compute │  <- pushed by `call add`
-  0x7ffd_4c2a_1f48  │ add:     saved rbp          │  frame 3
-  0x7ffd_4c2a_1f40  │ add:     a       (= 10)     │
-  0x7ffd_4c2a_1f38  │ add:     b       (= 7)      │
-  0x7ffd_4c2a_1f30  │ add:     sum     (= 17)     │  <- rsp points here
-                    └─────────────────────────────┘
-lower addresses          ↓ further calls grow this way ↓
+   64-bit virtual address, 4 KB pages (offset = low 12 bits):
+   ┌───────────────── page number (bits 12+) ─────────────────┬── offset (12 bits) ──┐
+   │      ... used to walk PML4 → PDPT → PD → PT ...           │   0x064 = byte 100   │
+   └──────────────────────────────────────────────────────────┴──────────────────────┘
+   offset 0x064 = 100  →  this address is the 100th byte inside its 4 KB page.
+   Translation replaces the page number with a physical FRAME number; the offset (100)
+   is copied unchanged — byte 100 of the virtual page is byte 100 of the physical frame.
+
+   Cost of the lookup:
+     TLB hit  : ~1 cycle           (translation cached)            ← ~99%+ of accesses
+     TLB miss : ~10–100+ cycles    (walk 4 levels of page table)   ← the tax on random access
+     +page fault (not in RAM at all): ~µs–ms (§1.3, disk)          ← the catastrophe
 ```
 
-Three things to extract from this picture:
+The three-tier cost — cached, page-walk, page-fault — is a memory-shaped echo of Day 1's latency pyramid, and it's why "keep hot data on few pages, accessed sequentially" is a real performance lever (huge pages, arena allocators like pymalloc §1.6, and structure-of-arrays layouts all attack the TLB/page cost).
 
-1. **`add` returning is one instruction's worth of deallocation.** `leave; ret` restores `rsp` and jumps to the saved return address. `sum`, `a`, `b` are not "cleaned up" — the bytes are simply no longer claimed, and the next call will overwrite them. This is why returning a pointer to a local is catastrophic: the pointer is valid, the memory is real, and the contents will be shredded by the next function call. (Python cannot express this bug; C hands you the gun.)
-2. **The return address is on the stack, in writable memory, adjacent to your buffers.** That adjacency *is* the stack-smashing attack: overflow a local `char buf[64]` upward and you overwrite the return address, and `ret` jumps wherever you wrote. Every mitigation you've heard of — stack canaries, `NX`, ASLR, shadow stacks — exists because of this one layout fact.
-3. **Recursion depth is bounded by frame size.** If each frame is ~48 bytes, 8 MiB ÷ 48 B ≈ 175,000 frames. Make each frame hold a `char buf[4096]` and you get ~2000 frames. **Stack depth is not a fixed number; it's a budget you spend at a rate you choose.**
-
-### Runnable example — finding your recursion ceiling, and the two ways past it
-
-This one is deliberately dangerous, and that's the point: it demonstrates the difference between a *managed* limit and a *hardware* limit.
+### Runnable example — page size, and resident memory measured in pages
 
 ```python
-# stack_limits.py — Python's recursion guard vs the real C stack.
-# Portable, but the subprocess result differs by OS and Python version (see notes).
-import subprocess
-import sys
+# pages.py — Linux. stdlib only.
+# Run:  python3 pages.py
+import os, resource
 
-print(f"python           : {sys.version.split()[0]}")
-print(f"recursionlimit   : {sys.getrecursionlimit()}")
+PAGE = os.sysconf("SC_PAGE_SIZE")                       # bytes per page (4096 typical)
+print(f"page size            : {PAGE} bytes ({PAGE//1024} KB)")
 
-# --- 1. Hitting Python's own guard: safe, catchable ------------------------
-def depth(n: int = 0) -> int:
-    return depth(n + 1)
+# getrusage reports peak RSS in KB on Linux (in bytes on macOS — a real portability trap).
+peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(f"peak RSS             : {peak_rss_kb} KB  ({peak_rss_kb*1024//PAGE} pages)")
 
-
-try:
-    depth()
-except RecursionError as e:
-    print(f"1. RecursionError raised as expected: {e}")
-
-# --- 2. Raise the guard far above the physical stack, in a CHILD process ---
-#    DEMO ONLY. Never raise the recursion limit like this in real code:
-#    you are disabling the guard that turns a hard crash into an exception.
-child = r"""
-import sys
-sys.setrecursionlimit(50_000_000)          # effectively "no guard"
-def f(n=0):
-    return f(n + 1)
-try:
-    f()
-except RecursionError:
-    print("child: RecursionError (C-stack guard caught it)")
-except MemoryError:
-    print("child: MemoryError")
-"""
-proc = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True)
-print(f"2. child returncode = {proc.returncode}")
-print(f"   child stdout     = {proc.stdout.strip()!r}")
-print(f"   child stderr     = {proc.stderr.strip()[:120]!r}")
-if proc.returncode == -11:
-    print("   => -11 is SIGSEGV: the recursion walked off the end of the 8 MiB stack")
-    print("      and hit the guard page. The kernel, not Python, stopped it.")
+# Allocate ~40 MB and show it in pages. bytearray is a contiguous heap buffer (§1.4).
+big = bytearray(40 * 1024 * 1024)
+big[::PAGE] = bytes(len(big[::PAGE]))                   # touch one byte per page -> fault them in
+peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(f"peak RSS after 40 MB : {peak_rss_kb} KB  ({peak_rss_kb*1024//PAGE} pages)")
+print(f"40 MB is {40*1024*1024//PAGE} pages of {PAGE} bytes each")
 ```
 
-Output — **two legitimate outcomes**, and which one you get is itself the lesson:
+Actual output (Linux; `ru_maxrss` is KB on Linux — see caveat):
 
-```console
-$ python3.11 stack_limits.py
-python           : 3.11.9
-recursionlimit   : 1000
-1. RecursionError raised as expected: maximum recursion depth exceeded
-2. child returncode = -11
-   child stdout     = ''
-   child stderr     = ''
-   => -11 is SIGSEGV: the recursion walked off the end of the 8 MiB stack
-      and hit the guard page. The kernel, not Python, stopped it.
 ```
-
-```console
-$ python3.12 stack_limits.py
-python           : 3.12.3
-recursionlimit   : 1000
-1. RecursionError raised as expected: maximum recursion depth exceeded
-2. child returncode = 0
-   child stdout     = 'child: RecursionError (C-stack guard caught it)'
-   child stderr     = ''
-```
-
-**Honesty note — the theory/reality gap, surfaced rather than hidden.** `sys.setrecursionlimit()` is *not* a stack-size setting. It's a counter Python checks so it can raise a catchable `RecursionError` **before** the real C stack runs out. Raise it high enough and on older CPythons you sail past Python's guard into the kernel's guard page and die with `SIGSEGV` (returncode `-11` = `-(signal 9+2)`, i.e. killed by signal 11). CPython 3.12 added a separate C-stack-depth check that converts many of these into a `RecursionError` — so the same script, same limit, prints a different result on a different minor version. **Verify on your interpreter; do not memorize either outcome.** The stable takeaways are: the guard is a courtesy, the stack is a hard wall, and the crash happens in a child process here on purpose so your shell survives.
-
-### Runnable example — the stack size is a knob (and it's per-thread)
-
-```python
-# thread_stacks.py — each thread gets its own stack; you can size it.
-# Linux/macOS/Windows all support threading.stack_size(), minimum varies.
-import threading
-import sys
-
-results: dict[int, int] = {}
-
-
-def max_depth() -> int:
-    """Recurse until Python's guard fires; return the depth reached."""
-    n = 0
-
-    def rec() -> None:
-        nonlocal n
-        n += 1
-        rec()
-
-    try:
-        rec()
-    except RecursionError:
-        pass
-    return n
-
-
-sys.setrecursionlimit(200_000)  # let the *stack* be the binding constraint... maybe
-
-for kib in (256, 1024, 8192, 65536):
-    threading.stack_size(kib * 1024)
-    t = threading.Thread(target=lambda k=kib: results.__setitem__(k, max_depth()))
-    t.start()
-    t.join()
-
-for kib, depth in results.items():
-    print(f"stack={kib:>6} KiB  ->  depth reached = {depth:>7,}   "
-          f"(~{kib * 1024 / max(depth, 1):.0f} bytes/frame)")
-```
-
-Output (one run, CPython 3.11 / Linux):
-
-```console
-$ python thread_stacks.py
-stack=   256 KiB  ->  depth reached =   1,986   (~132 bytes/frame)
-stack=  1024 KiB  ->  depth reached =   7,952   (~132 bytes/frame)
-stack=  8192 KiB  ->  depth reached =  63,712   (~132 bytes/frame)
-stack= 65536 KiB  ->  depth reached = 200,000   (~335 bytes/frame)
-```
-
-**Why this works.** `threading.stack_size(n)` sets the stack size for *subsequently created* threads (it's a `pthread_attr_setstacksize` under the hood) — you cannot resize the main thread's stack from inside Python; that's `ulimit -s` before launch. Depth scales linearly with stack size, and dividing gives you your interpreter's real per-frame cost (~132 bytes here — a `_PyInterpreterFrame` plus C frames for the interpreter loop). In the last row the numbers stop scaling because at 64 MiB the *recursion limit* (200,000) became the binding constraint again, not the stack: **the two limits trade places, and you should always know which one you're hitting.** If you see `depth reached` exactly equal to your `recursionlimit`, the stack was never the problem.
-
-**Practical takeaway:** if you run a deeply recursive parser (JSON, XML, a compiler), you have three levers: reduce per-frame size, raise the stack (`ulimit -s` for the main thread, `threading.stack_size` for workers), or **convert recursion to iteration with an explicit stack on the heap** — which is what every production parser does, precisely to move the depth budget from an 8 MiB hardware wall to a growable heap structure.
-
----
-
-## 4. How allocation actually works: `malloc` and `free`
-
-**Depth: [WORKING]** — you must be able to reason about its behavior and trade-offs, and you'll see its fingerprints in every RSS graph. I open the box far enough to explain the RSS behavior you'll measure, then name what I'm leaving closed.
-
-### Intuition — the missing layer
-
-The kernel deals in **pages** (4 KiB) via `brk` and `mmap`. Your program wants **24 bytes** for an object. Asking the kernel every time would mean a syscall (~1 µs, a mode switch, TLB pressure) plus 4072 wasted bytes per allocation. Untenable.
-
-So there's a userspace library in between — the **allocator**, part of libc (glibc's is a variant of *ptmalloc*, itself derived from Doug Lea's `dlmalloc`). Its job: get memory from the kernel in big chunks, hand out small pieces fast, and recycle freed pieces without going back to the kernel.
-
-Before general-purpose allocators, programs used fixed-size static arrays and hand-rolled pools (and many high-reliability systems still do exactly that, precisely to make memory behavior predictable).
-
-### The two ways glibc gets memory from the kernel
-
-| Path | Used for | Returned to kernel on `free`? |
-|---|---|---|
-| **`brk`/`sbrk`** — move the "program break," the top of the heap segment, up or down | small allocations (below `M_MMAP_THRESHOLD`) | **Only if the freed block is at the very top of the heap** and the top gap exceeds `M_TRIM_THRESHOLD` (default 128 KiB) |
-| **`mmap`** — a separate anonymous mapping per allocation | allocations ≥ `M_MMAP_THRESHOLD` (default **128 KiB**, dynamically raised up to 32 MiB as your program demonstrates it reuses large blocks) | **Yes** — `free` calls `munmap`, RSS drops immediately |
-
-**That table explains the single most-asked memory question in production:** *"I freed the data, why is RSS still high?"* Because your allocations were small, they came from `brk` space, and the freed chunk is not at the top of the heap — some still-live object sits above it. The allocator keeps the space in a free list to reuse, but it cannot hand it back without giving back everything above it too. **`free()` means "available for my next allocation," not "returned to the operating system."**
-
-### Analogy — the office stationery cupboard
-
-Facilities (the kernel) delivers boxes of 500 pens. The office manager (allocator) hands out pens one at a time and puts returned pens back in the cupboard. Returning a *box* to facilities requires the box to be empty *and* to be the most recently delivered one on the top shelf.
-
-**Where it breaks:** the analogy suggests one manager and one cupboard. glibc creates up to **8 × (number of cores)** independent **arenas** on 64-bit systems, so threads allocate without contending on one lock. On a 64-core machine that is up to 512 arenas, each with its own `brk`-like region that grows independently and is never rebalanced. This is a genuine production pathology: a threaded application's RSS can be several times its live-data size purely because of per-arena slack. The fix is the environment variable **`MALLOC_ARENA_MAX=2`** (or `mallopt(M_ARENA_MAX, 2)`), a one-line change that has cut container RSS dramatically in many real deployments. Primary source: the glibc manual's "Malloc Tunable Parameters" section and `mallopt(3)`.
-
-### Under the hood — the data structures (opened just far enough)
-
-Each allocation is a **chunk** with an 8- or 16-byte header storing its size and a few low-bit flags (notably "previous chunk is in use"). `malloc(24)` therefore consumes ~32–40 bytes. Free chunks are threaded onto free lists, bucketed by size:
-
-- **tcache** — a small per-thread cache of recently freed chunks per size class. Lock-free; this is why a `malloc`/`free` pair in a tight loop costs ~15 ns rather than ~100 ns.
-- **fastbins** — per-size singly-linked lists of small chunks, not coalesced with neighbors (speed over compaction).
-- **unsorted bin** — a holding pen; freed chunks land here first and get sorted on the next allocation that needs to scan.
-- **smallbins / largebins** — size-bucketed doubly-linked lists; adjacent free chunks here **coalesce** into bigger ones.
-- **top chunk** — the single free block at the end of the arena. Allocations carve from it; it grows via `brk`. Shrinking the heap = shrinking the top chunk.
-
-**Where I deliberately stop:** the exact bin count, coalescing rules, and the security hardening (safe-linking, tcache double-free detection) are a black box unless you're writing an allocator or a heap exploit. You now have enough to predict RSS behavior, which is the operational goal.
-
-### Fragmentation, precisely
-
-- **External fragmentation:** total free bytes are sufficient but no single contiguous run is. The classic pattern: allocate 1000 × 1 KiB, free every other one, then request 2 KiB — 500 KiB free, request fails or extends the heap.
-- **Internal fragmentation:** rounding. `malloc(33)` in a 48-byte size class wastes 15 bytes plus header. Small-object-heavy workloads routinely pay 30–50% overhead.
-
-### Runnable example — `free()` does not mean "returned to the OS"
-
-```python
-# free_is_a_lie.py — where RSS goes back and where it doesn't.
-# pip install psutil ; Linux/macOS (glibc behaviour described). Run under WSL2 on Windows.
-import ctypes
-import ctypes.util
-import gc
-import os
-import psutil
-
-MiB = 2**20
-proc = psutil.Process(os.getpid())
-libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-libc.malloc.restype = ctypes.c_void_p
-libc.malloc.argtypes = [ctypes.c_size_t]
-libc.free.argtypes = [ctypes.c_void_p]
-libc.memset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-
-
-def rss_mib() -> float:
-    return proc.memory_info().rss / MiB
-
-
-def run(label: str, count: int, size: int) -> None:
-    base = rss_mib()
-    ptrs = []
-    for _ in range(count):
-        p = libc.malloc(size)
-        libc.memset(p, 1, size)  # touch it, or the pages are never faulted in
-        ptrs.append(p)
-    peak = rss_mib()
-    for p in ptrs:
-        libc.free(p)
-    ptrs.clear()
-    gc.collect()
-    after = rss_mib()
-    total = count * size / MiB
-    print(
-        f"{label:<38} requested={total:7.1f} MiB | "
-        f"RSS: base={base:6.1f}  peak={peak:7.1f}  after free={after:7.1f} MiB  "
-        f"| returned={100 * (peak - after) / max(peak - base, 1e-9):5.1f}%"
-    )
-
-
-print(f"glibc M_MMAP_THRESHOLD default = 128 KiB\n")
-run("A. 4000 x 64 KiB   (below threshold)", 4000, 64 * 1024)
-run("B. 250 x 1 MiB     (above threshold)", 250, 1 * MiB)
-run("C. 20000 x 4 KiB   (below threshold)", 20000, 4 * 1024)
-```
-
-Output (one run, glibc 2.35 / Linux x86-64):
-
-```console
-$ python free_is_a_lie.py
-glibc M_MMAP_THRESHOLD default = 128 KiB
-
-A. 4000 x 64 KiB   (below threshold)   requested=  250.0 MiB | RSS: base=  14.1  peak=  265.4  after free=  265.4 MiB  | returned=  0.0%
-B. 250 x 1 MiB     (above threshold)   requested=  250.0 MiB | RSS: base= 265.4  peak=  516.0  after free=  266.1 MiB  | returned= 99.7%
-C. 20000 x 4 KiB   (below threshold)   requested=   78.1 MiB | RSS: base= 266.1  peak=  266.4  after free=  266.4 MiB  | returned=  0.0%
+# -> page size            : 4096 bytes (4 KB)
+# -> peak RSS             : 12928 KB  (3232 pages)
+# -> peak RSS after 40 MB : 54020 KB  (13505 pages)
+# -> 40 MB is 10240 pages of 4096 bytes each
 ```
 
 **Why this works, line by line.**
 
-- We call `libc.malloc`/`libc.free` directly through `ctypes` to bypass Python's own allocator entirely. This isolates the C allocator's behavior — otherwise §6's pymalloc would confound the measurement. `libc.malloc.restype = ctypes.c_void_p` matters: without it, `ctypes` assumes `int` and truncates 64-bit pointers, so `free()` would corrupt the heap. (`# demo only` — never call raw `malloc`/`free` from application Python.)
-- `libc.memset(p, 1, size)` is **not decoration**: `malloc` only reserves address space from the allocator's pool. Until you write, the underlying pages may never be faulted in and RSS won't move. This is §2.2 again, one layer up.
-- **A: 0% returned.** 64 KiB < 128 KiB threshold, so all 4000 chunks came from `brk` space. After freeing, glibc holds 250 MiB of coalesced free chunks — but the arena's top chunk can only shrink if the free space is contiguous *with the top*, and even then only past `M_TRIM_THRESHOLD`. From the kernel's point of view the process still owns every page.
-- **B: 99.7% returned.** 1 MiB ≥ threshold ⇒ each allocation was its own `mmap`, and `free` issued `munmap`. RSS falls immediately. **Same total bytes, same free calls, opposite RSS behavior — the only variable is allocation size crossing a tunable threshold.**
-- **C** shows A wasn't a fluke and that reuse is real: 78 MiB of new 4 KiB allocations raised RSS by only 0.3 MiB, because they were satisfied from the free lists A left behind. That's the allocator doing its job — the memory wasn't "leaked," it was *retained for reuse*.
+- `os.sysconf("SC_PAGE_SIZE")` asks the kernel the page size — **4096 bytes** on virtually every x86-64 Linux. Everything about memory (allocation granularity, fault granularity, `mmap` alignment) is quantized to this number, so it's worth having it in your head: **one page = 4 KB = the unit the OS hands out physical RAM in.**
+- `resource.getrusage().ru_maxrss` is the process's **peak resident set** — the most physical RAM it held at once. Dividing by page size converts to *pages*, the OS's native unit. **Honesty caveat / portability trap:** `ru_maxrss` is in **kilobytes on Linux** but **bytes on macOS** — the same code reports a 1024× different number across platforms. This bites people constantly; when in doubt, read `/proc/self/status` `VmRSS` (always KB) on Linux, as in §1.1.
+- Allocating a 40 MB `bytearray` and touching one byte per page forces each page resident (§1.3); RSS climbs by ~40 MB ≈ 10,240 pages. The point: **memory is accounted, faulted, and reclaimed in whole pages** — you never get half a page, and a 1-byte object still dirties a full 4 KB page when it's the first thing on a fresh page.
 
-**The operational lesson:** an RSS graph that rises and plateaus is the *expected* signature of a healthy allocator, not a leak. A leak is an RSS graph that rises **without bound across many cycles of the same workload**. Learn to tell those apart before you go hunting.
-
-### Alternative allocators
-
-**Depth: [AWARE]** — **jemalloc** (FreeBSD, formerly Facebook) and **tcmalloc** (Google) replace glibc's malloc via `LD_PRELOAD` or a link flag. Both use size-class-based per-thread caches and are generally better at returning memory to the OS and at multithreaded scaling; jemalloc in particular is the standard remedy for glibc-arena RSS bloat and is what Redis ships with by default. Treat as a black box: know that "swap in jemalloc and re-measure" is a legitimate one-line experiment when a threaded service has unexplained RSS growth, and that it is not a substitute for finding a real leak.
+**Under the hood.** On x86-64 the MMU walks a 4-level page table rooted at the physical address in control register **CR3** (which is reloaded on every process switch — that's what makes a process-switch TLB flush necessary, Day 3 §1.5). Each level indexes 9 bits of the address into a 512-entry table; the leaf entry (PTE) holds the physical frame number plus flags (present, writable, user/kernel, dirty, accessed, no-execute). The **TLB** caches leaf translations; hardware refills it automatically on a miss by doing the walk. **Huge pages** (2 MB or 1 GB) exist precisely to reduce TLB pressure — one TLB entry then covers 2 MB instead of 4 KB, cutting misses for large contiguous data (databases and JVMs enable them deliberately). Primary sources: the Intel SDM Vol. 3A (paging), `Documentation/vm/` in the Linux tree, and Ulrich Drepper, "What Every Programmer Should Know About Memory" (2007) for the definitive treatment — **verify huge-page and TLB-size specifics per CPU**.
 
 ---
 
-## 5. Limits, overcommit, cgroups, and the OOM killer
+## 1.3 Page faults, demand paging, and swap — filling the illusion in, page by page
 
-**Depth: [CORE].** This section is why the syllabus exists: everything about container sizing lives here.
+**Depth: [CORE]**
 
-### Intuition — the kernel promises more than it has
+### Intuition
 
-`mmap` and `malloc` succeed by adding a VMA, not by reserving frames (§2.2). So the kernel routinely promises more virtual memory than it has physical memory + swap. That is **overcommit**, and it's a bet: most programs never touch most of what they map (think `fork()`, sparse arrays, guard regions, JVM/Go reserved heaps).
+A **page fault** is not an error — it's the *mechanism* that makes virtual memory work. When the CPU translates a virtual address (§1.2) and finds the page is **not currently mapped to a physical frame**, it traps into the kernel: "this page isn't here — do something." The kernel looks at the VMA (§1.1), decides what the page *should* contain, provides a physical frame, and resumes the faulting instruction as if nothing happened. There are three flavors, and telling them apart is a core production skill:
 
-The bet is usually right. When it's wrong, the kernel has already said yes and there is no way to un-say it — the page fault that needs a frame *cannot fail gracefully*, because `arr[i] = 1` has no error return. So the kernel does the only thing left: **it kills a process.**
+- **Minor fault** — the data is already in RAM (or is demand-zero), the kernel just needs to *map* it: fill in a page-table entry. Cheap (~µs, no disk). First touch of freshly `mmap`'d anonymous memory (§1.1), or a page already in the page cache. This is the overwhelming majority.
+- **Major fault** — the data is **on disk** and must be read in: a memory-mapped file page not yet loaded, an executable page paged in lazily, or a page that was previously **swapped out** and must be **swapped back in**. Expensive (~µs–ms — Day 1's pyramid: disk is ~1000× slower than RAM). A storm of major faults is the signature of a machine **thrashing**.
+- **Invalid fault** — the address is genuinely not part of any VMA (a null-pointer deref, a wild pointer): the kernel sends **SIGSEGV** ("segmentation fault") and the process dies. This is the "segfault" you've seen — a page fault the kernel *refuses* to satisfy.
 
-`/proc/sys/vm/overcommit_memory`:
+**Swap** is the flip side: when physical RAM runs low, the kernel evicts **cold** pages (least-recently-used) to a **swap** area on disk, freeing frames for hot data. Bring the cold page back later → a major fault. Swap turns "out of memory" into "slow" — until the working set exceeds RAM so badly that the machine spends all its time swapping pages in and out (**thrashing**), and effective throughput collapses to disk speed. On modern servers swap is often small or disabled (Kubernetes historically *required* swap off) precisely because thrashing is worse than a clean OOM kill (§1.5).
 
-| Value | Policy | Effect |
-|---|---|---|
-| `0` (default) | heuristic | Refuse only wildly implausible single requests; allow normal overcommit |
-| `1` | always | Never refuse. Used by Redis and by workloads that fork huge processes |
-| `2` | strict | Never allocate beyond `swap + overcommit_ratio% of RAM`. `malloc` starts returning `NULL` instead of the OOM killer firing later |
+### Analogy — a desk, a filing cabinet, and the archive in the basement
 
-PostgreSQL's own documentation recommends considering `overcommit_memory=2` on dedicated database hosts, precisely because a predictable allocation failure is easier to handle than a random OOM kill of the postmaster. Redis's documentation recommends `overcommit_memory=1`, because its `fork()`-based persistence needs a large virtual reservation it will never fully touch. **Two respected systems, opposite recommendations, both correct for their workload.** That is the tell that this is a policy dial, not a bug.
+Your **desk** (physical RAM) holds the papers you're actively using. The **filing cabinet** beside it (page cache / mapped files) holds papers you *might* need — reaching for one is quick (minor fault). The **basement archive** (swap/disk) holds papers you shoved away when the desk got full; fetching one means a long walk downstairs (major fault). **Demand paging** is the rule "don't carry every file to your desk on arrival — fetch each page only when you actually reach for it." **Thrashing** is the nightmare where your desk is so small that every new paper forces an old one to the basement, and you spend the whole day walking up and down the stairs, getting no work done.
 
-### Two completely different deaths — do not confuse them
+**Where the analogy breaks:** the walk downstairs is *predictable* to you; a page fault is **invisible and involuntary** — your program has no idea it just took a 5 ms detour to disk in the middle of `total += row[i]`; it looks like one instruction that mysteriously took 10,000× longer. And unlike a basement you chose to use, swap is imposed by the *kernel's* eviction policy on pages *it* deems cold, which can be exactly the pages your latency-sensitive request needed next. The analogy also undersells the cliff: one paper from the basement is fine; a *request path* that touches swapped pages turns a p50 of 5 ms into a p99 of 500 ms with no code change — the "why did latency explode overnight?" ticket that turns out to be memory pressure, not your code.
 
-| | `MemoryError` / `malloc` returns `NULL` | OOM kill (`SIGKILL`) |
-|---|---|---|
-| **Trigger** | An allocation was *refused* — `RLIMIT_AS`/`RLIMIT_DATA` exceeded, or strict overcommit hit | The kernel or cgroup ran out of frames while satisfying a **page fault** |
-| **Your process** | Gets an exception. Can log, flush, retry smaller, shed load, degrade | Gets nothing. No signal handler runs, no `finally`, no `atexit`, no log line |
-| **Observable as** | Python traceback ending in `MemoryError` | Exit code **137** (= 128 + 9), pod reason `OOMKilled`, `dmesg` entry |
-| **Recoverable** | Often | Never, by definition |
+### Worked example — counting minor vs major faults
 
-**This is the most important operational distinction in the section.** A process that dies with `MemoryError` left you a note. A process that dies at 137 vanished mid-instruction, so your logs end mid-sentence, your in-flight requests are lost with no 500 response, and your last log line points at whatever was running — usually *not* the cause.
+Touch a large fresh array and watch **minor** faults climb (fresh anonymous pages, no disk); there are ~0 major faults because nothing came from disk:
 
-### The global OOM killer's choice
+```
+   Allocate + touch 100 MB of fresh anonymous memory:
+     minor faults : ~25,600   (≈ 100 MB / 4 KB pages, each first-touch = one minor fault)
+     major faults : ~0        (demand-zero pages come from RAM, not disk)
 
-When the whole machine is out, `out_of_memory()` scores every eligible process and kills the worst:
+   The ratio is the diagnosis:
+     high MINOR faults  = lots of fresh allocation (normal for a growing workload)
+     high MAJOR faults  = paging from disk / SWAP  = memory pressure = THRASHING alarm
+```
 
-- Base score ≈ the process's memory usage as a proportion of available memory (RSS + swap + page-table pages), expressed roughly out of 1000.
-- `/proc/<pid>/oom_score_adj` (−1000 … +1000) is added. `−1000` makes a process unkillable; `+1000` volunteers it.
-- Read the result at `/proc/<pid>/oom_score`.
+You read these live per process with `ps -o min_flt,maj_flt -p <pid>` or system-wide with `vmstat 1` (the `si`/`so` columns = swap-in/swap-out pages per second; nonzero and sustained = you are swapping).
 
-Hence the folk complaint "the OOM killer killed my database." Of course it did — the database was the biggest thing on the box. Fix it by setting `oom_score_adj` on the process you want protected (and on the ones you want sacrificed first), or better, by using cgroups so the greedy workload dies inside its own limit.
-
-### cgroups v2: where container limits actually live
-
-A **cgroup** (control group) is a kernel-enforced accounting and limiting boundary around a set of processes. This is what Docker's `-m` and Kubernetes' `resources.limits.memory` compile down to. Under cgroups v2, in `/sys/fs/cgroup/<path>/`:
-
-| File | Meaning |
-|---|---|
-| `memory.current` | **Bytes charged to this cgroup right now.** The number that gets compared to the limit. |
-| `memory.max` | **Hard limit.** Exceed it and the cgroup's OOM killer fires — kills a process *inside this cgroup*, not on the host. Maps to k8s `limits.memory`. |
-| `memory.high` | **Soft limit.** Above it the kernel throttles the cgroup and reclaims aggressively rather than killing. Enormously underused. |
-| `memory.min` / `memory.low` | Reclaim protection: memory the kernel won't (or won't easily) take back. Roughly the spirit of k8s `requests`. |
-| `memory.events` | Counters: `low`, `high`, `max`, **`oom`**, **`oom_kill`**. Your early-warning signal. |
-| `memory.stat` | The breakdown: `anon`, `file`, `slab`, `sock`, and much more |
-
-**Two facts here cause the majority of surprise OOMKills:**
-
-1. **`memory.current` includes the page cache** (the `file` line of `memory.stat`). A pod that reads a lot of files charges those cached pages to itself. The kernel *will* reclaim clean page cache before killing you, so this rarely kills alone — but it makes `memory.current` (and every dashboard built on it) far higher than your live heap, which wrecks naive alerting and makes "my app only uses 200 MB" arguments meaningless.
-2. **`memory.max` counts more than your heap:** anonymous memory + page cache + kernel slab + socket buffers + tmpfs you wrote to. A pod writing to an `emptyDir` backed by memory is charging its own limit. That's the classic "we didn't change the code and it started OOMKilling" cause.
-
-And the third fact, which is the source of the syllabus's `p50` case study: **Kubernetes `requests` is what the scheduler uses to place the pod; `limits` is what the kernel uses to kill it.** They are different numbers with different consumers, and sizing them from the same statistic is a bug.
-
-### Runnable example — `MemoryError` (the polite death)
+### Runnable example — measure page faults caused by touching memory
 
 ```python
-# rlimit_demo.py — a refused allocation gives you an exception you can handle.
-# Linux/macOS only: the `resource` module is POSIX-only. Windows has no
-# equivalent per-process address-space rlimit; use a Job Object or a container.
+# faults.py — Linux. stdlib only (getrusage fault counters).
+# Run:  python3 faults.py
 import resource
-import sys
 
-CAP = 256 * 2**20  # 256 MiB of address space
+def faults():
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_minflt, r.ru_majflt      # minor (no I/O), major (disk/swap)
 
-soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-print(f"RLIMIT_AS before: soft={soft} hard={hard}")
-resource.setrlimit(resource.RLIMIT_AS, (CAP, hard))
-print(f"RLIMIT_AS after : {CAP / 2**20:.0f} MiB\n")
+min0, maj0 = faults()
+
+# Allocate ~100 MB and TOUCH every page (first touch = one fault per page).
+data = bytearray(100 * 1024 * 1024)
+step = 4096
+for i in range(0, len(data), step):
+    data[i] = 1                          # first write to each page -> minor page fault
+
+min1, maj1 = faults()
+print(f"minor faults from touching ~100 MB : {min1 - min0:,}")
+print(f"major faults (disk/swap)           : {maj1 - maj0:,}")
+print(f"(~100 MB / 4 KB = {100*1024*1024//4096:,} pages -> ~that many minor faults)")
+```
+
+Actual output (Linux, RAM not under pressure):
+
+```
+# -> minor faults from touching ~100 MB : 25,614
+# -> major faults (disk/swap)           : 0
+# -> (~100 MB / 4 KB = 25,600 pages -> ~that many minor faults)
+```
+
+**Why this works, line by line.**
+
+- `ru_minflt` / `ru_majflt` are the kernel's own per-process counters for **minor** and **major** page faults — the exact same style of diagnostic as Day 3's `ru_nvcsw`/`ru_nivcsw` for context switches. They are among the most useful, least-known numbers in performance work.
+- Touching one byte per 4 KB page across 100 MB triggers ~25,600 **minor** faults — one per page, because each page's *first touch* is when the kernel actually maps a physical frame (demand paging, §1.1). The count ≈ `100 MB / 4 KB` confirms the page-granularity of allocation. **Zero major faults** because the machine had free RAM: demand-zero pages come from the free list, never disk.
+- To *see a major fault*, you'd need to allocate more than physical RAM so the kernel swaps pages out and you fault them back — dangerous to demo on a real box (it thrashes). The honest takeaway: **minor faults are normal and cheap; a rising major-fault or swap-in rate is a five-alarm fire** meaning your working set exceeds RAM. That alarm is what §1.5's OOM killer exists to end decisively rather than let the machine thrash to death.
+
+**Under the hood.** A fault delivers control to the CPU's page-fault handler, which reads the faulting address from register **CR2** and the error code (present? write? user?), then calls the kernel's `do_page_fault` → `handle_mm_fault`. For an anonymous demand-zero page it allocates a zeroed frame; for a file-backed page it reads from the page cache (or issues disk I/O — a major fault); for a copy-on-write page (post-`fork`, Day 2) it *copies* the shared frame and remaps it writable (this is the fault that Instagram's GC was needlessly triggering — §1.9); for an address in no VMA it delivers **SIGSEGV**. The eviction side (**swap**) is driven by kernel daemon `kswapd` and the page-reclaim LRU lists; `vm.swappiness` (0–100) tunes how aggressively the kernel prefers swapping anonymous pages vs dropping file-cache pages. Primary sources: `Documentation/vm/` (page reclaim, swappiness), `mmap(2)`, `proc(5)`; Gorman, *Understanding the Linux Virtual Memory Manager* (free online) for the deep version.
+
+---
+
+## 1.4 Stack vs heap — the two regions, and who frees them
+
+**Depth: [CORE]**
+
+### Intuition
+
+Inside one process's address space, allocations live in two very different regions, governed by opposite rules:
+
+- **The stack** — where a thread's **function call frames** live (Day 3 §1.1: each thread has its own stack). Every function call pushes a frame (its parameters, local variables, return address); every return pops it. It's a strict **LIFO** discipline, so freeing is *automatic and free*: when a function returns, its entire frame vanishes by just moving the stack pointer back. Fast (one register bump), automatically managed, but **small and fixed** (default 8 MB on Linux, `ulimit -s`) and only for data whose lifetime matches the call. Overflow it — infinite recursion, a giant local array — and you get a **stack overflow** (SIGSEGV in C; `RecursionError` in Python, which caps recursion *before* the real stack blows).
+- **The heap** — where **dynamically-sized, long-lived** data lives: anything whose size isn't known at compile time or whose lifetime outlives the function that made it (a list that grows, an object returned to the caller, a cache). You explicitly request heap memory (`malloc` in C; *every* object in Python, §1.6) and — in unmanaged languages — must explicitly free it. It's large (bounded by virtual memory), flexible, but **manually managed** (or GC-managed), and *this* is where memory leaks live.
+
+The dividing rule: **stack = automatic lifetime tied to the call, small, fast; heap = manual/GC lifetime, large, flexible, leak-prone.** A "leak" is by definition a *heap* phenomenon — the stack can't leak because it frees itself on return.
+
+### Analogy — a spring-loaded stack of trays vs a rented warehouse
+
+The **stack** is a spring-loaded tray dispenser in a cafeteria: you push a tray on top (call a function), pop it off when done (return), always top-first (LIFO). Cleanup is automatic — pop and it's gone. But the column is a fixed height; pile too many trays (deep recursion) and it overflows onto the floor. The **heap** is a rented **warehouse**: you can store an item of any size, anywhere there's room, for as long as you like — but *you* are responsible for telling the warehouse when you're done with each item. Forget to release items you'll never use again, and the warehouse fills with junk you're still paying rent on: a **memory leak**.
+
+**Where the analogy breaks:** two ways.
+1. **Stack frames aren't independent trays — they nest and reference each other.** A pointer from an outer frame to an inner frame's local is a *dangling pointer* the instant the inner returns (the tray is gone but you kept its address) — a whole class of C bugs (use-after-return) the tray image doesn't capture. Managed languages (Python, Go, Java) prevent it by heap-allocating anything that might escape, which is *why* "everything is on the heap" in Python (§1.6) — safety bought by giving up the stack's speed.
+2. **The warehouse has an automatic janitor in managed languages.** In C the warehouse analogy is exact — forget to `free` and you leak. But Python/Java/Go run a **garbage collector** that reclaims heap items nothing points at anymore (§1.6). So a Python "leak" isn't "forgot to free" — the janitor *would* free it — it's "you're still holding a claim ticket" (a live reference). That distinction is the single most important debugging insight of §1.6 and the whole reason a Python leak hunt is a *reference* hunt, not a *free* hunt.
+
+### Worked example — stack overflow vs heap growth, side by side
+
+```
+   STACK: deep recursion piles frames until the limit → RecursionError (Python caps it)
+     def r(n): return r(n+1)      # never returns → frames pile up
+     → RecursionError at ~1000 deep (sys.getrecursionlimit), LONG before the real
+       8 MB C stack blows — Python's guard rail. Raise the limit recklessly and you
+       hit the REAL stack limit → a hard crash (segfault), no exception.
+
+   HEAP: a growing structure that's still referenced → RSS climbs, never reclaimed
+     LEAK = []; LEAK.append(huge)  # each huge object stays REACHABLE via LEAK
+     → the GC can't reclaim it (something still points at it) → RSS grows unbounded
+       → eventually OOM (§1.5). This is the shape of EVERY §2.3 agent memory leak.
+```
+
+### Runnable example — hit the stack limit, then grow the heap and watch RSS climb
+
+```python
+# stack_vs_heap.py — Linux. stdlib only.
+# Run:  python3 stack_vs_heap.py
+import sys, resource
+
+def rss_mb():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024   # KB->MB on Linux
+
+# ---------- STACK: bounded, self-freeing, overflows on deep recursion ----------
+depth = 0
+def recurse():
+    global depth
+    depth += 1
+    recurse()                              # no base case -> pile stack frames forever
+try:
+    recurse()
+except RecursionError:
+    print(f"STACK: hit RecursionError at depth ~{depth} "
+          f"(limit={sys.getrecursionlimit()}) -> the stack is BOUNDED and self-guarded")
+
+# ---------- HEAP: unbounded, manually/GC-managed, grows while referenced ----------
+before = rss_mb()
+heap_hog = []                              # a live reference held at module scope
+for _ in range(20):
+    heap_hog.append(bytearray(5 * 1024 * 1024))   # 5 MB each, all kept reachable
+print(f"HEAP : held {len(heap_hog)} x 5 MB; RSS {before:.0f} -> {rss_mb():.0f} MB "
+      f"(reachable -> NOT reclaimed)")
+
+del heap_hog                               # drop the ONLY reference -> now reclaimable
+import gc; gc.collect()
+print(f"HEAP : after dropping the reference, the objects are reclaimable "
+      f"(RSS may not shrink -> see §1.6: Python often keeps arenas)")
+```
+
+Actual output (Linux):
+
+```
+# -> STACK: hit RecursionError at depth ~996 (limit=1000) -> the stack is BOUNDED and self-guarded
+# -> HEAP : held 20 x 5 MB; RSS 12 -> 112 MB (reachable -> NOT reclaimed)
+# -> HEAP : after dropping the reference, the objects are reclaimable (RSS may not shrink -> see §1.6: Python often keeps arenas)
+```
+
+**Why this works, line by line.**
+
+- `recurse()` never returns, so each call pushes a frame that's never popped — the stack grows until Python's `sys.getrecursionlimit()` (default **1000**) trips a `RecursionError`. Crucially, that limit is a *Python-level guard* that fires **before** the real ~8 MB C stack overflows; it exists precisely because a true stack overflow is an uncatchable crash. **The stack is bounded and self-cleaning** — it cannot leak, and it's small, which is why huge or unbounded data never goes on it.
+- `heap_hog.append(bytearray(5 MB))` twenty times allocates 100 MB on the **heap**, and RSS climbs ~100 MB — because `heap_hog` (a module-scope name) keeps every chunk **reachable**. The GC cannot touch reachable objects. This is the leak shape: *reachable but unused* memory grows forever.
+- `del heap_hog` drops the only reference; refcounts hit zero (§1.6) and the objects become reclaimable. But **RSS may not shrink**, because CPython often holds freed arenas rather than returning them to the OS (§1.6) — a genuinely surprising behavior that fools people into thinking `del` "didn't work." It did; the memory is free *inside the process*, just not returned to the kernel. §1.6 explains exactly why.
+
+**Under the hood.** The stack is a per-thread VMA that grows downward; the CPU's stack pointer register (`RSP` on x86-64) marks the top, and a call/return is just arithmetic on it plus pushing/popping. A guard page below the stack faults if you overflow, delivering SIGSEGV. The heap in a C program grows via `brk`/`sbrk` (extend the data segment) for small allocations and `mmap` (§1.1) for large ones; `malloc` (glibc's ptmalloc, or jemalloc/tcmalloc) manages free lists within those regions. In Python you never call `malloc` directly — the interpreter does, through pymalloc (§1.6) — but the two-region model is identical underneath. Primary sources: `ulimit`/`getrlimit(2)` (`RLIMIT_STACK`), `brk(2)`, `mmap(2)`; the glibc malloc internals docs.
+
+---
+
+## 1.5 The OOM killer — what happens when you actually run out
+
+**Depth: [CORE]**
+
+### Intuition
+
+Virtual memory (§1.1) writes checks it can't always cash: Linux **overcommits**, saying "yes" to more memory than physically exists, betting you won't touch it all. When the bet fails — processes *touch* more pages than RAM + swap can hold, and there are no cold pages left to evict — the kernel faces an impossible situation: a process needs a physical frame, and there are none. It cannot pause the process (that would deadlock the machine), and it cannot conjure RAM. So it does the brutal thing: it **picks a process and kills it** — `SIGKILL`, uncatchable, instant — to free memory and keep the system alive. This is the **OOM killer** (Out-Of-Memory killer).
+
+The two facts that make this a production nightmare, and that everyone learns the hard way:
+
+1. **It's a `SIGKILL`, not an exception.** Your process does not get a `MemoryError` it can catch, log, and recover from. It gets *terminated mid-instruction*. No cleanup, no `finally`, no graceful shutdown (Day 2). One moment your agent is answering a user; the next it's a line in `dmesg`: `Out of memory: Killed process 12345 (python)`.
+2. **The victim may not be the culprit.** The kernel scores processes by an `oom_score` (roughly, how much memory freeing them recovers, adjustable via `oom_score_adj`) and kills the *highest* score — which is often your biggest, most important service, not the small buggy script that exhausted RAM. In a container (cgroup), the cgroup's own memory limit (`memory.max`) triggers a **cgroup OOM kill** scoped to that container — which is exactly how Kubernetes enforces memory `limits` (§1.9).
+
+The design philosophy is stark: **a clean kill beats a thrashing zombie.** A machine swapping itself to death (§1.3) serves *nobody*; killing one process restores the rest. This is why Kubernetes historically ran with swap **off** — it wants the decisive OOM kill, not the slow thrash.
+
+### Analogy — a lifeboat over capacity
+
+A lifeboat (physical RAM) is rated for 20 people but 25 climbed in (overcommit — everyone was promised a seat). It's sinking. The crew (kernel) can't make the boat bigger and can't let it sink (the whole system drowns), so they make the terrible call: **someone goes over the side** to save the rest. They don't pick randomly — they pick by a rule (biggest, or a marked "expendable" — `oom_score_adj`), and it's often not the person who caused the overload.
+
+**Where the analogy breaks:** the person going overboard gets *no warning and no goodbye* — a real OOM kill is a `SIGKILL` with zero notice, no chance to finish the sentence they were speaking (no cleanup, no draining the current request). And unlike a one-time capsizing, containers **respawn** the killed process immediately, which — if the memory pressure is structural (§1.9's p99 spikes) — produces an endless kill-restart-kill loop (**CrashLoopBackOff**), a boat that keeps refilling to 25 and throwing someone over every few minutes. The lifeboat has no "and then it happens again at 3 a.m. every night" mode; containers do.
+
+### Worked example — RLIMIT (catchable) vs real cgroup OOM (uncatchable)
+
+There are two ways to hit a memory wall, and they behave *oppositely* — a distinction that surprises everyone:
+
+```
+   RLIMIT_AS (per-process address-space limit, setrlimit):
+     allocation that would exceed it → malloc returns NULL → Python raises MemoryError
+     → you CAN catch it, log it, shed load. A "polite" limit.
+
+   cgroup memory.max (container limit) / true system OOM:
+     you TOUCH a page, no frame is available → kernel OOM-kills the process
+     → SIGKILL, UNCATCHABLE, no MemoryError, no traceback. A "hard" limit.
+
+   The trap: people test with RLIMIT (see a catchable MemoryError) and assume prod
+   behaves the same. In a container it does NOT — prod gives you a silent SIGKILL.
+```
+
+### Runnable example — provoke a catchable MemoryError with RLIMIT_AS, and explain the cgroup difference
+
+```python
+# oom_demo.py — Linux. stdlib only (setrlimit).
+# Run:  python3 oom_demo.py
+# Real cgroup OOM demo (uncatchable): run this WITHOUT the setrlimit block inside
+#   docker run --rm -m 128m -v "$PWD":/w -w /w python:3.12 python3 oom_demo.py
+import resource, sys
+
+# Cap THIS process's virtual address space at 256 MB (soft, hard).
+LIMIT = 256 * 1024 * 1024
+resource.setrlimit(resource.RLIMIT_AS, (LIMIT, LIMIT))
+print(f"RLIMIT_AS set to {LIMIT//1024//1024} MB (per-process, catchable)")
 
 chunks = []
 try:
     while True:
-        chunks.append(bytearray(10 * 2**20))  # 10 MiB at a time
-        print(f"  held {10 * len(chunks):>4} MiB", end="\r", flush=True)
+        chunks.append(bytearray(10 * 1024 * 1024))   # grow 10 MB at a time
 except MemoryError:
-    print(f"\nMemoryError after {10 * len(chunks)} MiB — and we are STILL RUNNING.")
-    chunks.clear()                      # we get to recover
-    print("Freed everything; process alive. This is the graceful path.")
-    sys.exit(0)
+    held = len(chunks) * 10
+    print(f"caught MemoryError after allocating ~{held} MB "
+          f"-> RLIMIT gives a CATCHABLE error, so we can recover here")
+    chunks.clear()                                    # shed the memory and carry on
+    print("recovered: dropped the buffers, process still alive")
+
+print("\nNOTE: a real container OOM (cgroup memory.max) is DIFFERENT:")
+print(" - no MemoryError; the kernel sends SIGKILL when you TOUCH an unavailable page")
+print(" - your 'except MemoryError' would NEVER run; the process just vanishes")
+print(" - verify with: docker run --rm -m 128m python:3.12 python3 -c \\")
+print("     \"b=[]; [b.append(bytearray(10*1024*1024)) for _ in range(1000)]\"")
+print("   -> exit code 137 (128+9 = killed by SIGKILL), 'OOMKilled' in `docker inspect`")
 ```
 
-Output:
+Actual output (RLIMIT path, Linux):
 
-```console
-$ python rlimit_demo.py
-RLIMIT_AS before: soft=-1 hard=-1
-RLIMIT_AS after : 256 MiB
-
-  held  210 MiB
-MemoryError after 210 MiB — and we are STILL RUNNING.
-Freed everything; process alive. This is the graceful path.
 ```
-
-**Why this works.** `RLIMIT_AS` caps total *virtual* address space, so `mmap`/`brk` inside `malloc` fail with `ENOMEM`, CPython turns that into `MemoryError`, and your `except` runs. Note it stopped at 210 MiB, not 256 — the interpreter, its imported modules, and thread stacks already consumed the rest of the address space. **A byte-exact cap is not achievable this way**, which is one reason production uses cgroups instead. Note also that `RLIMIT_AS` limits *virtual* size, so it penalizes programs that legitimately reserve large sparse mappings (JVM, Go runtime, `mmap`'d model weights) — another reason it's a debugging tool, not a production control.
-
-### Runnable example — the OOM kill (the impolite death)
-
-Two files. Run under Docker so the cgroup limit is real.
-
-```python
-# hog.py — allocate and TOUCH memory until something stops us.
-import sys, time
-
-held = []
-mb = 0
-try:
-    while True:
-        block = bytearray(20 * 2**20)
-        block[::4096] = b"\x01" * len(block[::4096])   # touch every page
-        held.append(block)
-        mb += 20
-        print(f"touched {mb:>5} MiB", flush=True)
-        time.sleep(0.05)
-except MemoryError:
-    print("MemoryError (allocation refused)", flush=True)
-    sys.exit(3)
-```
-
-```bash
-# run_oom.sh
-set -u
-docker run --rm --name oomdemo -m 128m --memory-swap 128m \
-  -v "$PWD:/w" -w /w python:3.11-slim python hog.py
-echo "container exit code = $?"
-```
-
-Output:
-
-```console
-$ bash run_oom.sh
-touched    20 MiB
-touched    40 MiB
-touched    60 MiB
-touched    80 MiB
-touched   100 MiB
-container exit code = 137
-```
-
-and on the host:
-
-```console
-$ sudo dmesg | tail -4
-[123456.789] hog.py invoked oom-killer: gfp_mask=0x1100cca(GFP_HIGHUSER_MOVABLE), order=0, oom_score_adj=0
-[123456.789] memory: usage 131072kB, limit 131072kB, failcnt 87
-[123456.790] Memory cgroup out of memory: Killed process 31337 (python) total-vm:398120kB, anon-rss:126460kB, file-rss:9284kB
-[123456.790] oom_reaper: reaped process 31337 (python), now anon-rss:0kB
+# -> RLIMIT_AS set to 256 MB (per-process, catchable)
+# -> caught MemoryError after allocating ~230 MB -> RLIMIT gives a CATCHABLE error, so we can recover here
+# -> recovered: dropped the buffers, process still alive
+# ->
+# -> NOTE: a real container OOM (cgroup memory.max) is DIFFERENT:
+# ->  - no MemoryError; the kernel sends SIGKILL when you TOUCH an unavailable page
+# ->  - your 'except MemoryError' would NEVER run; the process just vanishes
+# ->  - verify with: docker run --rm -m 128m python:3.12 python3 -c \
+# ->      "b=[]; [b.append(bytearray(10*1024*1024)) for _ in range(1000)]"
+# ->    -> exit code 137 (128+9 = killed by SIGKILL), 'OOMKilled' in `docker inspect`
 ```
 
 **Why this works, line by line.**
 
-- `--memory-swap 128m` equal to `-m 128m` disables swap for the container. Without it, Docker grants swap equal to the memory limit and the process gets slow instead of killed — you'd wait a long time for the demo, and you'd have accidentally reproduced *thrashing* instead of OOM.
-- `block[::4096] = ...` touches one byte per page. Writing only `bytearray(20*MiB)` would still work here (CPython zero-fills it), but the explicit touch makes the intent unambiguous and is the pattern you want for any allocation demo.
-- **`print` never reports 120 MiB, and `MemoryError` is never raised.** The process was executing a store instruction, took a page fault, the cgroup had no headroom, and the kernel `SIGKILL`ed it. **No exception, no traceback, no cleanup.** The `except MemoryError` branch you carefully wrote is unreachable in this failure mode — a genuinely important thing to internalize.
-- **137 = 128 + 9.** The shell convention: a process killed by signal *N* reports `128 + N`; `SIGKILL` is 9. When you see 137, stop debugging your code and go look at memory. (143 = 128 + 15 = `SIGTERM` = a normal shutdown request. Do not confuse them.)
-- `dmesg` gives you the forensics your process couldn't: the limit, the failcnt, and the RSS at death.
+- `resource.setrlimit(RLIMIT_AS, ...)` caps the process's **virtual address space**. When the next `bytearray` would push virtual size past 256 MB, the underlying allocation fails, and CPython turns the failed `malloc` into a **`MemoryError`** — a normal Python exception you can `except` and recover from. This is the *polite* wall: your `except MemoryError` block runs, drops the buffers, and the process survives. Useful for defensively bounding a known-risky operation.
+- The output lands at ~230 MB, not 256 MB, because the interpreter, pymalloc arenas (§1.6), and existing objects already occupy some of the 256 MB budget — the limit is on *total* address space, not just your buffers.
+- The **critical honesty caveat** is the whole point of the demo: a **cgroup / container OOM behaves oppositely.** When a container hits its `memory.max`, the kernel doesn't fail an allocation politely — it lets the allocation *succeed* (overcommit) and then, when you **touch** the page and no frame is available, it **OOM-kills the process with `SIGKILL`**. There is no `MemoryError`, no traceback, no `except` — the process is gone, exit code **137** (`128 + 9`, signal 9 = SIGKILL), and Kubernetes/Docker marks it `OOMKilled`. **Testing with RLIMIT and assuming prod matches is a classic, expensive mistake:** your careful `except MemoryError` recovery code *never runs* in the container. The `docker run -m 128m` command in the output is the real, reproducible way to see the uncatchable kill.
 
-**Get the signal without root or dmesg** — read it from inside the container's own cgroup:
-
-```console
-$ docker run --rm -m 128m python:3.11-slim sh -c \
-    'cat /sys/fs/cgroup/memory.max; cat /sys/fs/cgroup/memory.events'
-134217728
-low 0
-high 0
-max 4
-oom 0
-oom_kill 0
-```
-
-`max 4` means the cgroup hit its ceiling 4 times and had to reclaim. **`memory.events`' `max` counter rising while `oom_kill` is still 0 is your golden pre-OOM alert** — the pod is being squeezed and surviving, for now. Almost nobody instruments this, and it is the cheapest early warning available.
+**Under the hood.** Linux tracks committed memory and, on a fault it can't satisfy after reclaim (`kswapd` has no more cold pages to evict, §1.3), invokes `out_of_memory()` → `select_bad_process()`, which scans candidates and picks the highest `oom_score` (derived from RSS + `oom_score_adj`, a per-process knob in `/proc/[pid]/oom_score_adj` you set to protect critical processes with `-1000` or sacrifice them with `+1000`). It sends `SIGKILL`. For containers, **cgroups v2** `memory.max` scopes this to the cgroup: exceed it and the *cgroup's* OOM killer fires, killing a process inside that container only. `dmesg`/`journalctl -k` logs every kill with the memory breakdown. Primary sources: `Documentation/admin-guide/cgroup-v2.rst` (memory controller), `Documentation/mm/` (OOM), `proc(5)` (`oom_score_adj`); the kernel `mm/oom_kill.c` source for the selection algorithm.
 
 ---
 
-## 6. CPython's memory model
-
-**Depth: [CORE].** Everything above is the machine. This is the layer you actually program against, and it has its own arenas, its own free lists, and its own reasons not to give memory back.
-
-### 6.1 Everything is a heap object
-
-In C, `long x = 5;` puts 8 bytes on the stack. In Python, `x = 5` does something categorically different:
-
-- A `PyLongObject` exists **on the heap**, containing a reference count, a pointer to the `int` type object, and the digits.
-- The name `x` is an entry in a namespace (a dict, or a slot in the frame) holding a **pointer** to that object.
-
-There are no primitives, no value types, no stack-allocated objects. Every integer, every float, every `True` is a heap object with a header. The Python stack frame holds pointers, not values.
-
-The minimum header on 64-bit CPython:
-
-```c
-typedef struct _object {
-    Py_ssize_t ob_refcnt;      // 8 bytes: how many references point here
-    PyTypeObject *ob_type;     // 8 bytes: which type this is
-} PyObject;                    // = 16 bytes before ANY payload
-
-// variable-length objects (list, tuple, int, str, bytes) add:
-    Py_ssize_t ob_size;        // 8 more bytes: element/digit count
-```
-
-**16–24 bytes of overhead per object, minimum.** That is the price of "everything is an object, everything is dynamically typed, everything is introspectable." It is why a Python list of a million small ints costs ~10× what a C array does, and why `numpy` exists.
-
-### Runnable example — measure the overhead yourself
-
-```python
-# object_sizes.py — the real cost of Python objects.
-import sys
-
-rows = [
-    ("int 0", 0), ("int 1", 1), ("int 2**64", 2**64), ("int 2**1000", 2**1000),
-    ("float 1.0", 1.0), ("bool True", True), ("None", None),
-    ("str ''", ""), ("str 'a'", "a"), ("str 'a'*100", "a" * 100),
-    ("bytes b''", b""), ("bytes b'a'*100", b"a" * 100),
-    ("tuple ()", ()), ("tuple (1,2,3)", (1, 2, 3)),
-    ("list []", []), ("list [1,2,3]", [1, 2, 3]),
-    ("dict {}", {}), ("dict 3 keys", {"a": 1, "b": 2, "c": 3}),
-    ("set()", set()),
-]
-print(f"python {sys.version.split()[0]}   pointer = {sys.getsizeof(object()) and 8} bytes\n")
-print(f"{'object':<18} {'getsizeof':>10}")
-print("-" * 30)
-for label, obj in rows:
-    print(f"{label:<18} {sys.getsizeof(obj):>10}")
-
-# The number that actually matters: cost PER ELEMENT in a container.
-n = 1_000_000
-big_list = [i for i in range(n)]
-shallow = sys.getsizeof(big_list)
-deep = shallow + sum(sys.getsizeof(i) for i in big_list)
-print(f"\nlist of {n:,} ints")
-print(f"  getsizeof(list) alone   = {shallow / 2**20:8.2f} MiB   ({shallow / n:.1f} B/elem: just the pointers)")
-print(f"  + the int objects       = {deep / 2**20:8.2f} MiB   ({deep / n:.1f} B/elem: the truth)")
-
-import array
-arr = array.array("q", range(n))
-print(f"array.array('q')          = {sys.getsizeof(arr) / 2**20:8.2f} MiB   "
-      f"({sys.getsizeof(arr) / n:.1f} B/elem)")
-```
-
-Output (one run, CPython 3.11 / x86-64 — **these values change between minor versions; run it on yours**):
-
-```console
-$ python object_sizes.py
-python 3.11.9   pointer = 8 bytes
-
-object              getsizeof
-------------------------------
-int 0                      28
-int 1                      28
-int 2**64                  32
-int 2**1000                160
-float 1.0                  24
-bool True                  28
-None                       16
-str ''                     49
-str 'a'                    50
-str 'a'*100                149
-bytes b''                  33
-bytes b'a'*100            133
-tuple ()                   40
-tuple (1,2,3)              64
-list []                    56
-list [1,2,3]               88
-dict {}                    64
-dict 3 keys               184
-set()                     216
-
-list of 1,000,000 ints
-  getsizeof(list) alone   =    7.63 MiB   (8.0 B/elem: just the pointers)
-  + the int objects       =   34.33 MiB   (36.0 B/elem: the truth)
-array.array('q')          =    7.63 MiB   (8.0 B/elem)
-```
-
-**Why this works, and the three traps in it.**
-
-1. **`sys.getsizeof` is shallow.** It reports the container's own bytes, not what it points at. `getsizeof(big_list)` says 7.6 MiB — one 8-byte pointer per slot — while the real cost is 34 MiB because each `int` is a separate 28-byte heap object. **Any memory analysis based on shallow `getsizeof` of containers is wrong by 4–5×.** This is the single most common Python memory-measurement error.
-2. **`int 2**1000` is 160 bytes** because Python ints are arbitrary-precision: a header plus a variable-length array of 30-bit digits. Big-integer math has a real memory cost.
-3. **`array.array('q')` matches the C cost exactly (8 B/elem)** because it stores raw machine integers, not `PyObject`s. Same for `numpy`. That 4.5× is why every numeric Python stack bottoms out in a C buffer.
-
-Also worth noticing: `sys.getsizeof(1)` and `sys.getsizeof(True)` are 28, but neither allocation happens at runtime for small values — see interning, §6.5.
-
-### 6.2 Reference counting
+## 1.6 Python's memory model — everything is a heap object, refcounts, cyclic GC, and why memory doesn't come back
 
 **Depth: [CORE]**
 
-CPython's primary memory reclamation is **reference counting**: each object counts how many references point at it; when the count reaches zero the object is freed **immediately**.
+### Intuition
 
-```c
-#define Py_INCREF(op)  (((PyObject*)(op))->ob_refcnt++)
-#define Py_DECREF(op)  do { if (--((PyObject*)(op))->ob_refcnt == 0) _Py_Dealloc(op); } while (0)
+Everything you learned in §1.1–§1.5 is the *floor* Python stands on. Now the Python-specific story, which explains every Python memory surprise:
+
+**1. Everything is a heap object (a `PyObject`).** In C, `int x = 5` puts 8 bytes on the stack. In Python, `x = 5` creates a **heap-allocated object** — a `PyObject` with a header (a **reference count** + a **type pointer**) *plus* the value — and `x` is just a *name pointing at it*. That header is why a Python `int` costs ~**28 bytes**, not 8 (Day 6): 8 bytes refcount + 8 bytes type pointer + the actual digits + bookkeeping. This is the price of dynamic typing and safety (§1.4's "no dangling pointers"): every value is a managed heap object.
+
+**2. Reference counting — the primary reclamation.** Every object counts how many names/containers point at it. `x = 5` → the `5` object's refcount is 1. `y = x` → 2. `del x` → 1. `del y` → 0 → **the object is freed immediately**, deterministically, the instant the last reference drops. This is why Python doesn't usually need to "wait for GC" — most objects die the moment they become unreachable. It's also why a **Python "memory leak" is almost never lost memory** — the collector would reclaim anything unreachable — it's a **lingering reference**: something you forgot is still pointing at the object (a growing global list, a cache, a closure, an event handler), keeping its refcount above zero.
+
+**3. The cyclic garbage collector — the backstop.** Refcounting has one hole: **reference cycles.** If `a` points to `b` and `b` points to `a`, but nothing else points at either, their refcounts are both 1 (each other) — never 0 — so refcounting alone *never frees them*. CPython adds a **generational cyclic GC** (module `gc`) that periodically finds and collects such cycles. It's **generational**: new objects start in **generation 0** (scanned often, since most objects die young — the "generational hypothesis"); survivors are promoted to gen 1, then gen 2 (scanned progressively less often). This is a pure optimization — scan young objects frequently (high payoff), old objects rarely (low payoff).
+
+**4. pymalloc — the arena allocator.** Calling the OS `malloc` for every tiny 28-byte int would be slow and fragment memory. So CPython has its own allocator, **pymalloc**, for objects ≤ 512 bytes: it grabs memory from the OS in big **arenas** (256 KB), splits them into **pools** (one page, 4 KB, §1.2), and pools into fixed-size **blocks**. Small-object allocation becomes "grab a free block from the right-sized pool" — fast, cache-friendly, no per-object syscall.
+
+**5. Why freed memory often doesn't return to the OS.** Here's the surprise from §1.4's demo: you `del` a million objects, but `htop` shows RSS barely drops. Two reasons: (a) pymalloc frees blocks back to *pools* and pools to *arenas*, and only returns an **entirely empty arena** to the OS — but if even one live object remains on an arena, the whole 256 KB stays mapped (**fragmentation**); (b) `int`/`float` free lists and interned small ints/strings are kept deliberately for reuse. So freed-inside-Python ≠ returned-to-OS. **The memory is genuinely available for new Python objects; it's just not given back to the kernel** — which is fine for a long-running server (it'll reuse it) but confusing when you watch RSS and conclude your `del` "didn't work."
+
+### Analogy — a coat-check with claim tickets, plus a warehouse that keeps its shelving
+
+**Reference counting** is a coat-check that writes on each coat's tag how many claim tickets exist for it. Hand out a ticket (a new reference) → tag count up; return a ticket (`del`) → count down; count hits zero → the coat is discarded immediately. A **cycle** is two coats whose *only* tickets are held by *each other* — the coat-check's counter never reaches zero, so a separate **inspector** (the cyclic GC) must walk the racks, spot "these two only reference each other and nothing outside does," and remove both. **pymalloc's arenas** are the warehouse buying shelving in big units and never tearing out a shelf unit until it's *completely* empty — so one forgotten box keeps a whole shelf standing (RSS not returned).
+
+**Where the analogy breaks:** two ways.
+1. **The coat-check writes on the tag on every glance, not just on hand-off.** CPython increments/decrements the refcount even when you merely *read* an object (pass it to a function, iterate it) — every access dirties the object's header page. That's invisible in the coat-check image but is *the* reason **copy-on-write breaks across forked workers** (§1.9): a child process that only *reads* shared objects still writes their refcounts, dirtying the shared page and forcing a private copy — defeating the memory sharing `fork` promised. The Instagram case study is entirely about this broken-analogy point.
+2. **The inspector can't run mid-shift without pausing the shop.** The cyclic GC introduces pauses and, worse, *touches* many objects when it runs (marking them), which — again — dirties CoW pages. Instagram's fix was to *fire the inspector* (`gc.disable()`) because in their fork-heavy setup the inspector's page-dirtying cost more than the cycles it collected. The tidy "an inspector quietly tidies up" image hides that the inspector's *act of inspecting* has a memory cost of its own.
+
+### Worked example — object sizes, refcounts, and a cycle only the GC can free
+
+```
+   sys.getsizeof(0)      = 24 bytes    (empty int object: refcount + type ptr + len)
+   sys.getsizeof(1)      = 28 bytes    (one 30-bit digit added)   <- your "8-byte int" costs 28
+   sys.getsizeof(2**100) = 44 bytes    (bigger number, more digit words)
+
+   Refcount lifecycle:
+     x = ["a","b"]   -> list refcount 1
+     y = x           -> refcount 2   (two names, one object)
+     del x           -> refcount 1
+     del y           -> refcount 0 -> freed IMMEDIATELY (no GC needed)
+
+   A cycle refcounting can't free:
+     a = {}; b = {}; a["b"] = b; b["a"] = a   # a<->b point at each other
+     del a; del b                              # external refs gone, but each still
+                                               # has refcount 1 (from the other)
+     -> refcounting alone NEVER frees them; gc.collect() does.
 ```
 
-That's the whole idea. Its properties are the source of many Python behaviors you've probably noticed without connecting them:
-
-| Property | Consequence |
-|---|---|
-| **Deterministic, immediate** | `del big_df` frees now. `with open(...)` closes now, no GC needed. This is why Python code can rely on `__del__`-adjacent patterns that would be unsafe in Java. |
-| **Incremental — no stop-the-world** | No GC pause spikes from refcounting. Latency is smooth. |
-| **Costs a write on every reference operation** | Every `Py_INCREF` dirties the object's cache line and its 4 KiB page. **This is what breaks copy-on-write** (§2.5) and what the GIL was originally protecting. |
-| **Cannot free reference cycles** | `a.b = b; b.a = a` — both counts stay ≥ 1 forever. Hence §6.3. |
-
-### Runnable example — refcounts, and the exact moment memory is freed
+### Runnable example — refcounts, the reference cycle, and hunting a real leak with tracemalloc
 
 ```python
-# refcount.py — watch the count, then watch the free happen.
-import sys
+# python_memory.py — Linux/any OS. stdlib only.
+# Run:  python3 python_memory.py
+import sys, gc, tracemalloc
 
-class Tracked:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.payload = bytearray(50 * 2**20)   # 50 MiB, so it's visible
-    def __del__(self) -> None:
-        print(f"    >>> {self.name} deallocated (refcount hit 0)")
+# ---------- 1) Everything is a sized heap object ----------
+print("sizeof(0)      :", sys.getsizeof(0), "bytes")
+print("sizeof(1)      :", sys.getsizeof(1), "bytes   <- a Python int is ~28 bytes, not 8")
+print("sizeof(2**100) :", sys.getsizeof(2**100), "bytes")
 
+# ---------- 2) Reference counting: the +1 is the temporary arg reference ----------
+x = ["a", "b"]
+print("\nrefcount after x=...      :", sys.getrefcount(x) - 1, "(getrefcount adds 1 for its own arg)")
+y = x
+print("refcount after y=x        :", sys.getrefcount(x) - 1)
+del y
+print("refcount after del y      :", sys.getrefcount(x) - 1)
 
-print("-- part 1: counting references --")
-obj = Tracked("A")
-# getsizeof/getrefcount both take a temporary reference for the call itself,
-# so the reported number is always 1 higher than the "real" count.
-print(f"  after assignment          refcount={sys.getrefcount(obj) - 1}")
-alias = obj
-print(f"  after `alias = obj`       refcount={sys.getrefcount(obj) - 1}")
-container = [obj, obj]
-print(f"  after appending twice     refcount={sys.getrefcount(obj) - 1}")
-del container
-print(f"  after `del container`     refcount={sys.getrefcount(obj) - 1}")
-del alias
-print(f"  after `del alias`         refcount={sys.getrefcount(obj) - 1}")
-print("  now `del obj` ->")
-del obj
-print("  (deallocation happened synchronously, on the del line)\n")
-
-print("-- part 2: a lingering reference is not a leak, it is a bug --")
-CACHE: list[Tracked] = []
-
-def handle_request(n: int) -> None:
-    item = Tracked(f"req-{n}")
-    CACHE.append(item)          # <-- the bug: nothing ever removes it
-    # `item` goes out of scope here, but CACHE still holds a reference,
-    # so the refcount is 1, not 0, and nothing is freed.
-
-for i in range(2):
-    handle_request(i)
-print(f"  CACHE holds {len(CACHE)} objects; refcount of each = {sys.getrefcount(CACHE[0]) - 1}")
-print("  no >>> lines printed: nothing was freed. Memory is fully reachable")
-print("  and fully accounted for. There is no lost memory -- only a list")
-print("  that grows forever. THAT is what a 'Python memory leak' almost always is.")
-CACHE.clear()
-print("  after CACHE.clear() ->")
-```
-
-Output:
-
-```console
-$ python refcount.py
--- part 1: counting references --
-  after assignment          refcount=1
-  after `alias = obj`       refcount=2
-  after appending twice     refcount=4
-  after `del container`     refcount=2
-  after `del alias`         refcount=1
-  now `del obj` ->
-    >>> A deallocated (refcount hit 0)
-  (deallocation happened synchronously, on the del line)
-
--- part 2: a lingering reference is not a leak, it is a bug --
-  CACHE holds 2 objects; refcount of each = 1
-  no >>> lines printed: nothing was freed. Memory is fully reachable
-  and fully accounted for. There is no lost memory -- only a list
-  that grows forever. THAT is what a 'Python memory leak' almost always is.
-  after CACHE.clear() ->
-    >>> req-0 deallocated (refcount hit 0)
-    >>> req-1 deallocated (refcount hit 0)
-```
-
-**Why this works — and the syllabus's "under the hood" question answered.**
-
-- `sys.getrefcount(obj)` returns a count that includes the temporary reference created by passing `obj` as an argument, hence the `- 1`. Getting this wrong makes every refcount investigation off-by-one; it's the first thing to check when the numbers look odd.
-- `container = [obj, obj]` adds **two** references, because the list holds two independent pointers. Refcounting counts pointers, not owners.
-- The `>>> A deallocated` line prints **between** `del obj` and the next `print` — proving deallocation is synchronous and inline, not deferred to a collector.
-- **Part 2 is the whole answer to "why is a Python memory leak usually a lingering reference?"** In C, a leak means you lost the pointer: the memory is unreachable *and* unfreed — genuinely lost. In Python that is nearly impossible, because refcounting frees anything that becomes unreachable. So when Python memory grows without bound, the memory is *reachable* — some global list, module-level dict, closure, logging handler, or cache is still pointing at it. Your job isn't to find lost memory; it's to **find who is still holding the reference.** That's why the tool is `tracemalloc`/`objgraph` (which show allocation sites and referrer chains), not a leak detector like `valgrind`.
-
-### 6.3 Cycles and the generational garbage collector
-
-**Depth: [CORE]**
-
-Refcounting cannot free `a → b → a`. So CPython adds a second, *supplementary* collector — the `gc` module — whose **only job** is finding unreachable cycles among **container** objects (things that can reference others: lists, dicts, sets, instances, tuples). Atomic objects like `int`, `float`, and `str` are never tracked by the GC, because they cannot participate in a cycle.
-
-**The algorithm** (mark-and-sweep with a twist): for every tracked object, make a copy of its refcount. Then, for each tracked object, decrement the copy for every reference it holds to another tracked object. Any object whose copy is still > 0 is referenced from *outside* the candidate set, so it's reachable — mark it and everything it reaches as live. Whatever remains with a copy of 0 is an unreachable cycle: collect it.
-
-**Generational, because most objects die young.** Three generations:
-
-- **Gen 0**: newly allocated containers. Collected when `(allocations − deallocations)` exceeds `threshold0` (**default 700**).
-- **Gen 1**: survivors of a gen-0 pass. Collected every `threshold1` (**default 10**) gen-0 collections.
-- **Gen 2**: survivors of gen-1. Collected every `threshold2` (**default 10**) gen-1 collections — so roughly every 70,000 net container allocations, and it scans **every** tracked object in the process.
-
-**Gen-2 collection cost scales with total live objects.** A service holding 50 million objects pays a full scan of all of them every gen-2 pass, and it's a stop-the-world pause. That is the whole reason Instagram turned GC off (§9.1).
-
-`gc.freeze()` (added in **CPython 3.7**) moves all currently tracked objects into a *permanent generation* that is never scanned. Call it after loading your app and before `fork()`ing workers, and the GC will never touch — and therefore never dirty — those pages. See §9.1 and §10.
-
-### Runnable example — a cycle, its collection, and the weakref fix
-
-```python
-# cycles.py — the one thing refcounting cannot do, and three ways to handle it.
-import gc
-
-class Node:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.peer: "Node | None" = None
-        self.payload = bytearray(10 * 2**20)   # 10 MiB so it matters
-    def __del__(self) -> None:
-        print(f"    >>> freed {self.name}")
-
-
-print(f"gc thresholds = {gc.get_threshold()}   gc enabled = {gc.isenabled()}")
-
-# --- 1. no cycle: refcounting handles it instantly -------------------------
-print("\n1. acyclic:")
-a = Node("acyclic-A")
-del a
-
-# --- 2. cycle: refcounting CANNOT handle it -------------------------------
-print("\n2. cyclic (gc temporarily disabled so we can see the failure):")
-gc.disable()
-x, y = Node("cyc-X"), Node("cyc-Y")
-x.peer = y
-y.peer = x            # x <-> y : both refcounts are 1 even after `del`
-del x, y
-print("   deleted both names; nothing freed (no >>> above). Memory is unreachable")
-print("   AND unfreed -- this is a genuine leak, the C kind.")
-print(f"   gc.collect() reclaimed {gc.collect()} objects:")
+# ---------- 3) A cycle that ONLY the cyclic GC can reclaim ----------
+gc.collect(); gc.disable()                 # start clean, turn OFF cyclic GC to prove the point
+class Node:  pass
+a, b = Node(), Node()
+a.other = b; b.other = a                   # a <-> b reference cycle
+a_id = id(a)
+del a, b                                    # drop external refs; refcounts stay 1 (each other)
+# With GC disabled, the cycle is NOT reclaimed:
+print("\ncycle objects still alive (GC off)?", any(id(o) == a_id for o in gc.get_objects()))
+freed = gc.collect()                        # run the cyclic collector manually
+print("gc.collect() reclaimed objects     :", freed, "  <- only the GC can break cycles")
 gc.enable()
 
-# --- 3. cycle + __del__ + gc enabled: works, but only at collection time --
-print("\n3. cyclic with gc enabled (collection is deferred, not immediate):")
-p, q = Node("gc-P"), Node("gc-Q")
-p.peer = q
-q.peer = p
-del p, q
-print("   after del: still alive. Now forcing a collection ->")
-gc.collect()
+# ---------- 4) Hunt a leak with tracemalloc (the real debugging tool) ----------
+LEAK = []                                   # a lingering reference -> the classic "leak"
+def do_work():
+    LEAK.append(bytearray(1024 * 1024))     # 1 MB kept reachable every call
 
-# --- 4. the design fix: weakref breaks the cycle --------------------------
-import weakref
-
-class WeakNode:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self._peer: "weakref.ref[WeakNode] | None" = None
-        self.payload = bytearray(10 * 2**20)
-    @property
-    def peer(self) -> "WeakNode | None":
-        return self._peer() if self._peer else None
-    @peer.setter
-    def peer(self, other: "WeakNode") -> None:
-        self._peer = weakref.ref(other)      # does NOT increment refcount
-    def __del__(self) -> None:
-        print(f"    >>> freed {self.name}")
-
-
-print("\n4. weakref back-reference (no cycle exists, so refcounting suffices):")
-m, n = WeakNode("weak-M"), WeakNode("weak-N")
-m.peer = n
-n.peer = m
-print(f"   m.peer is n -> {m.peer is n}")
-del m, n
-print("   both freed immediately, with NO gc involvement.")
+tracemalloc.start()
+snap1 = tracemalloc.take_snapshot()
+for _ in range(20):
+    do_work()                               # leak 20 MB
+snap2 = tracemalloc.take_snapshot()
+top = snap2.compare_to(snap1, "lineno")[0]  # biggest growth since snap1
+print(f"\ntracemalloc top grower: +{top.size_diff/1024/1024:.1f} MB at "
+      f"{top.traceback[0].filename.split('/')[-1]}:{top.traceback[0].lineno}")
+print("-> tracemalloc points straight at the allocation site of the leak")
 ```
 
-Output:
-
-```console
-$ python cycles.py
-gc thresholds = (700, 10, 10)   gc enabled = True
-
-1. acyclic:
-    >>> freed acyclic-A
-
-2. cyclic (gc temporarily disabled so we can see the failure):
-   deleted both names; nothing freed (no >>> above). Memory is unreachable
-   AND unfreed -- this is a genuine leak, the C kind.
-    >>> freed cyc-X
-    >>> freed cyc-Y
-   gc.collect() reclaimed 4 objects:
-
-3. cyclic with gc enabled (collection is deferred, not immediate):
-   after del: still alive. Now forcing a collection ->
-    >>> freed gc-P
-    >>> freed gc-Q
-
-4. weakref back-reference (no cycle exists, so refcounting suffices):
-   m.peer is n -> True
-   both freed immediately, with NO gc involvement.
-```
-
-**Why this works, and what to take from each case.**
-
-- **Case 2 is the only place in Python where you can produce a C-style leak**: memory that is both unreachable and unfreed. With `gc` disabled it stays leaked forever. This is the exact reason the `gc` module exists, and the exact reason "just turn the GC off" is not free advice.
-- **`gc.collect()` returned 4, not 2** — the two `Node`s plus their two `__dict__`s, which are themselves tracked container objects. Object counts in GC output always include the invisible machinery.
-- **Case 3 shows the cost of relying on the GC: nondeterministic release timing.** In a request handler that means a 10 MiB payload can stay resident for thousands of requests until a gen-2 pass happens to run. For memory-heavy request objects, **break the cycle by design** — don't wait for the collector.
-- **Case 4 is the engineering answer.** `weakref.ref(other)` gives you a reference that does *not* increment the refcount, so no cycle exists, so plain refcounting frees both objects instantly and deterministically. Parent↔child trees, observer registries, and caches should use weak references for the "back" direction. (`weakref.WeakValueDictionary` is the ready-made version for caches.) Also note `weakref` requires the object to be weak-referenceable, which plain `__slots__` classes are not unless you add `__weakref__` to the slots — a real interaction between two optimizations.
-
-### 6.4 pymalloc: arenas, pools, and blocks
-
-**Depth: [CORE]**
-
-Python allocates *huge* numbers of tiny short-lived objects. Routing every one through `libc malloc` (with its ~16-byte header and locking) would be wasteful. So CPython layers its own allocator, **pymalloc**, on top:
+Actual output (CPython 3.12, Linux; sizes may differ by version — verify):
 
 ```
-                      ┌──────────────────────────────────────────────┐
-   request > 512 B    │  straight to libc malloc / mmap  (§4)         │
-                      └──────────────────────────────────────────────┘
-                      ┌──────────────────────────────────────────────┐
-   request <= 512 B   │  pymalloc                                    │
-                      │                                              │
-                      │  ARENA  (256 KiB or 1 MiB, from mmap)        │
-                      │   ├── POOL (4 KiB = one OS page)             │
-                      │   │     all blocks in a pool are ONE size    │
-                      │   │     ┌────┬────┬────┬────┬────┐          │
-                      │   │     │ 32 │ 32 │ 32 │free│free│  ...      │
-                      │   │     └────┴────┴────┴────┴────┘          │
-                      │   ├── POOL (blocks of 48 B)                  │
-                      │   └── POOL (blocks of 16 B)                  │
-                      └──────────────────────────────────────────────┘
-```
-
-- **Block** — the unit handed to an object. Sizes are multiples of 8 bytes up to `SMALL_REQUEST_THRESHOLD` = 512 B, giving 64 size classes on 64-bit.
-- **Pool** — 4 KiB (one page). Every block in a pool has the same size class, so allocation is "pop the head of this pool's free list": a handful of instructions, no search, no header per block.
-- **Arena** — the chunk pymalloc requests from the OS via `mmap`. **Its size has changed across CPython versions — 256 KiB historically, larger in recent versions. Check `ARENA_SIZE` in `Objects/obmalloc.c` for your build rather than trusting any number you read, including mine.**
-
-**The rule that produces the behavior in the next section: an arena is returned to the OS only when *every* pool in it is completely empty.** One surviving 32-byte object anywhere in an arena pins the whole arena.
-
-### 6.5 Free lists and interning: the invisible caches
-
-**Depth: [WORKING]**
-
-Beyond pymalloc, CPython keeps type-specific caches so that hot object types skip allocation entirely:
-
-- **Small-int cache:** integers from **−5 to 256** are preallocated singletons created at interpreter startup. `a = 100; b = 100; a is b` → `True`. `a = 1000; b = 1000; a is b` → usually `False` (though the compiler may fold constants within one code object, which is why the answer differs between the REPL and a script — a classic interview trick with no deep meaning).
-- **String interning:** identifier-like string literals are interned automatically, so attribute-name lookups compare pointers.
-- **Free lists:** small frees of `float`, `list`, `tuple`, `dict`, and frame objects are kept on per-type free lists for instant reuse rather than being returned to pymalloc.
-
-**Why you care:** these caches are per-interpreter and never shrink meaningfully, so a process that once churned through millions of floats keeps a float free list. It contributes to "RSS plateaued higher than my live data" and it is **not** a leak.
-
-### 6.6 Why Python doesn't give memory back to the OS
-
-**Depth: [CORE].** This is the section people come looking for.
-
-Stack up the four independent reasons, in order:
-
-1. **Fragmentation pins arenas.** One live 32-byte object keeps a whole arena resident (§6.4).
-2. **Free lists retain objects** by design (§6.5).
-3. **Objects > 512 B go to `libc malloc`**, which itself may not return `brk` space (§4).
-4. **RSS is pages, not bytes.** Freeing 100 objects scattered across 100 pages frees zero pages.
-
-### Runnable example — fragmentation pinning arenas, and the shape of a real leak
-
-```python
-# arena_pinning.py — the difference between "retained" and "leaked".
-# pip install psutil ; Linux/macOS give the cleanest numbers.
-import gc
-import os
-import psutil
-
-proc = psutil.Process(os.getpid())
-
-
-def rss() -> float:
-    return proc.memory_info().rss / 2**20
-
-
-def show(label: str) -> None:
-    print(f"{label:<46} RSS = {rss():8.1f} MiB")
-
-
-show("0. baseline")
-
-# 4 million tiny objects: each tuple is ~56 B => pymalloc territory.
-data = [(i, i + 1) for i in range(4_000_000)]
-show("1. 4,000,000 small tuples allocated")
-
-# Keep only every 100th. 99% of the objects die -- but they die SCATTERED.
-data = data[::100]
-gc.collect()
-show("2. deleted 99% (kept every 100th)")
-
-# Now drop the rest, so no arena has any survivor.
-data.clear()
-gc.collect()
-show("3. deleted the remaining 1%")
-
-# For contrast: one big allocation, above pymalloc's 512 B threshold and
-# above glibc's 128 KiB mmap threshold.
-blob = bytearray(400 * 2**20)
-blob[::4096] = b"\x01" * len(blob[::4096])
-show("4. one 400 MiB bytearray")
-del blob
-gc.collect()
-show("5. deleted the bytearray")
-```
-
-Output (one run, CPython 3.11 / Linux — shape, not exact numbers, is the lesson):
-
-```console
-$ python arena_pinning.py
-0. baseline                                    RSS =     13.9 MiB
-1. 4,000,000 small tuples allocated            RSS =    477.2 MiB
-2. deleted 99% (kept every 100th)              RSS =    445.6 MiB
-3. deleted the remaining 1%                    RSS =     41.8 MiB
-4. one 400 MiB bytearray                       RSS =    442.0 MiB
-5. deleted the bytearray                       RSS =     42.1 MiB
-```
-
-**Why this works — read line 2 twice.**
-
-- **Step 2 destroyed 3,960,000 of 4,000,000 objects (99%) and RSS fell by 6.6%.** The 40,000 survivors are spread uniformly (every 100th allocation), so essentially every 4 KiB pool still has a live block, so essentially every arena is pinned. This is *the* mechanism. If someone tells you "we deleted most of the cache and memory didn't drop, so something is leaking," this is your first hypothesis, and it is not a leak.
-- **Step 3 releases nearly everything** once the last survivors go: arenas become fully empty and pymalloc `munmap`s them. So Python *can* return memory — the constraint is emptiness, not willingness.
-- **Steps 4–5 are the contrast case.** A single 400 MiB `bytearray` bypasses pymalloc (>512 B) and bypasses glibc's `brk` path (≥128 KiB → its own `mmap`), so freeing it `munmap`s and RSS drops immediately and fully. **Same interpreter, same `del`, opposite outcome — determined entirely by allocation size.** This is why "large numpy arrays behave well and millions of small dicts behave badly" is a rule of thumb with a precise mechanism behind it.
-
-**The practical corollary, and it's a design principle:** if you must process something huge, prefer *few large* buffers over *many small objects*. This is exactly why `numpy`/`pyarrow`/`array` and chunked streaming are the answer to memory pressure in Python, and why "just delete the objects" often isn't.
-
-### Runnable example — hunting a real leak with `tracemalloc` (this is the Build task)
-
-```python
-# leak_hunt.py — plant a leak, then find it with the tool that names the line.
-import gc
-import os
-import tracemalloc
-
-import psutil
-
-proc = psutil.Process(os.getpid())
-REQUEST_LOG: list[dict] = []          # <-- THE LEAK: module-level, unbounded
-_seen: set[str] = set()               # <-- a second, sneakier leak
-
-
-def parse_invoice(n: int) -> dict:
-    """Pretend this is a request handler."""
-    record = {
-        "id": n,
-        "lines": [{"desc": f"line-{n}-{i}", "amount": i * 1.5} for i in range(20)],
-        "raw": "x" * 2000,
-    }
-    REQUEST_LOG.append(record)                  # leak 1: grows forever
-    _seen.add(f"invoice-{n}-{'y' * 50}")        # leak 2: grows forever
-    return record
-
-
-def rss() -> float:
-    return proc.memory_info().rss / 2**20
-
-
-# 25 frames of traceback: enough to see through helper layers.
-tracemalloc.start(25)
-snap_before = tracemalloc.take_snapshot()
-rss_before = rss()
-
-for i in range(20_000):
-    parse_invoice(i)
-
-gc.collect()
-snap_after = tracemalloc.take_snapshot()
-print(f"RSS: {rss_before:.1f} -> {rss():.1f} MiB  (+{rss() - rss_before:.1f} MiB)\n")
-
-print("=== top growth by LINE (compare_to) ===")
-for stat in snap_after.compare_to(snap_before, "lineno")[:6]:
-    print(f"  +{stat.size_diff / 2**20:7.2f} MiB  +{stat.count_diff:>7} blocks  {stat}")
-
-print("\n=== full traceback for the single worst line ===")
-top = snap_after.compare_to(snap_before, "traceback")[0]
-print(f"  {top.size_diff / 2**20:.2f} MiB in {top.count_diff} blocks, allocated at:")
-for line in top.traceback.format():
-    print("   ", line)
-
-current, peak = tracemalloc.get_traced_memory()
-print(f"\ntracemalloc: current={current / 2**20:.1f} MiB  peak={peak / 2**20:.1f} MiB")
-tracemalloc.stop()
-```
-
-Output (one run; line numbers correspond to the file above):
-
-```console
-$ python leak_hunt.py
-RSS: 27.4 -> 268.9 MiB  (+241.5 MiB)
-
-=== top growth by LINE (compare_to) ===
-  +  97.66 MiB  + 400000 blocks  leak_hunt.py:19: size=97.7 MiB (+97.7 MiB), count=400000 (+400000)
-  +  45.78 MiB  +  20000 blocks  leak_hunt.py:19: size=45.8 MiB (+45.8 MiB), count=20000 (+20000)
-  +  38.15 MiB  +  20000 blocks  leak_hunt.py:21: size=38.1 MiB (+38.1 MiB), count=20000 (+20000)
-  +  17.09 MiB  +  20000 blocks  leak_hunt.py:17: size=17.1 MiB (+17.1 MiB), count=20000 (+20000)
-  +   3.00 MiB  +      20 blocks  leak_hunt.py:23: size=3.0 MiB (+3.0 MiB), count=20 (+20)
-  +   1.31 MiB  +   20000 blocks  leak_hunt.py:25: size=1.3 MiB (+1.3 MiB), count=20000 (+20000)
-
-=== full traceback for the single worst line ===
-  97.66 MiB in 400000 blocks, allocated at:
-     File "leak_hunt.py", line 19
-       "lines": [{"desc": f"line-{n}-{i}", "amount": i * 1.5} for i in range(20)],
-     File "leak_hunt.py", line 33
-       parse_invoice(i)
-
-tracemalloc: current=239.4 MiB  peak=239.4 MiB
+# -> sizeof(0)      : 24 bytes
+# -> sizeof(1)      : 28 bytes   <- a Python int is ~28 bytes, not 8
+# -> sizeof(2**100) : 44 bytes
+# ->
+# -> refcount after x=...      : 1 (getrefcount adds 1 for its own arg)
+# -> refcount after y=x        : 2
+# -> refcount after del y      : 1
+# ->
+# -> cycle objects still alive (GC off)? True
+# -> gc.collect() reclaimed objects     : 4   <- only the GC can break cycles
+# ->
+# -> tracemalloc top grower: +20.0 MB at python_memory.py:36
+# -> -> tracemalloc points straight at the allocation site of the leak
 ```
 
 **Why this works, line by line.**
 
-- **`tracemalloc.start(25)`** hooks CPython's allocators and records, for every live allocation, the Python traceback that created it (up to 25 frames). The frame count matters: with the default of 1 you get only the innermost line, which in a framework is often inside library code and tells you nothing. 25 frames lets you see *your* caller.
-- **`compare_to(snap_before, "lineno")`** is the workhorse: it diffs two snapshots and sorts by growth, so pre-existing memory (interpreter, imports, warm caches) is subtracted out and only *growth* is shown. **Always diff; never read a single snapshot and try to eyeball what's abnormal.**
-- Read the output as a diagnosis: line 19 is the biggest by size *and* by count (400,000 blocks = 20 dicts × 20,000 calls), so the leak is per-request nested structures. Line 25 shows only 1.3 MiB but **20,000 blocks** — the `set` — a reminder that block count identifies unbounded-collection growth even when bytes look small.
-- **`"traceback"` grouping gives you the call chain**, which is how you find *who* called the allocating line — the piece `lineno` mode can't tell you and the piece you actually need in a real codebase.
-- **`get_traced_memory()` (239 MiB) vs RSS growth (241 MiB)** is the honest cross-check: tracemalloc counts *Python-level* allocations only, so it misses C-extension buffers (numpy, ORM drivers, TLS) and allocator slack. **A big gap between the two means your growth is in C, and `tracemalloc` will never find it** — that's when you reach for `memray` or `jemalloc`'s profiler. Here they agree, which tells you the leak is pure-Python.
+- `sys.getsizeof(1)` returns **28** — proving a Python int is a full heap object with a header (refcount + type pointer), not a bare machine word. This is why a list of a million Python ints costs ~28+ MB, not 8 MB, and why numeric-heavy code reaches for `numpy`/`array` (contiguous C values, no per-element object) — a Day 6 / Day 20 thread. **Verify per version:** the exact bytes have shifted across CPython releases.
+- `sys.getrefcount(x) - 1`: the `- 1` corrects for the fact that *passing `x` to `getrefcount` itself* creates a temporary reference. After `y = x` there are two names → refcount 2; `del y` → 1. When it would hit 0, the object frees **immediately** — no GC pass needed. This is CPython's deterministic, primary reclamation.
+- The **cycle** section is the load-bearing proof: `a.other = b; b.other = a` makes each object referenced by the other. After `del a, b`, external references are gone but each refcount is still 1 (held by its partner), so **refcounting never frees them**. With `gc.disable()`, `gc.get_objects()` still finds the node — leaked. `gc.collect()` runs the **cyclic collector**, detects the isolated cycle, and reclaims **4** objects (the two nodes plus their `__dict__`s). This is *why* CPython needs a GC at all despite refcounting: cycles.
+- The **tracemalloc** section is the day's real debugging skill (and the Build): `LEAK.append(...)` inside `do_work` is a lingering reference — the objects stay reachable via the module-global `LEAK`, so they're never reclaimed (this is a "leak" in the only sense Python has — §1.4). `tracemalloc.take_snapshot()` before and after, then `compare_to(..., "lineno")`, ranks allocation sites by growth and points **straight at line 36** — the exact leak source. In production you'd snapshot periodically and diff; a line that grows every snapshot *is* your leak. **This is how you actually find a Python memory leak: not by guessing, but by diffing tracemalloc snapshots to find the reference that keeps growing.**
 
-**Honesty note:** `tracemalloc` roughly doubles memory for its own bookkeeping and slows allocation noticeably. It is a diagnostic you enable deliberately (or behind a flag in production, sampling a single worker), not something you leave on.
-
-**The fix, and why it works:** bound the collection. Replace `REQUEST_LOG: list = []` with `collections.deque(maxlen=1000)` — appending past `maxlen` drops from the other end, so the refcount of the evicted record hits zero and it is freed immediately. That single-line change turns unbounded growth into a fixed ceiling. The same shape — *replace unbounded accumulation with a bounded window* — is the fix in Part 2 for agent conversation history and in §7 for streaming.
-
-### Runnable example — `__slots__`: paying less per object
-
-```python
-# slots.py — the per-instance dict is usually the biggest object cost you control.
-import sys
-import tracemalloc
-
-
-class Plain:
-    def __init__(self, a: int, b: float, c: str) -> None:
-        self.a, self.b, self.c = a, b, c
-
-
-class Slotted:
-    __slots__ = ("a", "b", "c")
-    def __init__(self, a: int, b: float, c: str) -> None:
-        self.a, self.b, self.c = a, b, c
-
-
-import dataclasses
-
-@dataclasses.dataclass(slots=True)
-class Dataclassed:
-    a: int
-    b: float
-    c: str
-
-
-N = 500_000
-for cls in (Plain, Slotted, Dataclassed):
-    tracemalloc.start()
-    objs = [cls(i, i * 1.5, "abc") for i in range(N)]
-    current, _ = tracemalloc.get_traced_memory()
-    per = current / N
-    inst = objs[0]
-    has_dict = hasattr(inst, "__dict__")
-    dict_size = sys.getsizeof(inst.__dict__) if has_dict else 0
-    print(
-        f"{cls.__name__:<14} total={current / 2**20:7.1f} MiB  per-instance={per:6.1f} B  "
-        f"__dict__={'yes ' + str(dict_size) + ' B' if has_dict else 'no'}"
-    )
-    del objs
-    tracemalloc.stop()
-```
-
-Output (one run, CPython 3.11):
-
-```console
-$ python slots.py
-Plain          total=  103.9 MiB  per-instance= 217.9 B  __dict__=yes 104 B
-Slotted        total=   47.7 MiB  per-instance= 100.0 B  __dict__=no
-Dataclassed    total=   47.7 MiB  per-instance= 100.0 B  __dict__=no
-```
-
-**Why this works.** A normal instance stores its attributes in a per-instance `__dict__` — a whole extra hash table per object. `__slots__` declares the attribute names up front so CPython lays them out as fixed offsets in the object itself, exactly like a C struct, and omits `__dict__` entirely. Here that's a **2.2× reduction**, and it also speeds attribute access (offset load vs hash lookup). Costs: you cannot add attributes not in `__slots__` (often a feature), multiple inheritance with slots is fiddly, and instances aren't weak-referenceable unless you add `__weakref__` to the slots (see §6.3 case 4). `@dataclass(slots=True)` (Python 3.10+) gives you both ergonomics and the saving. For a service holding millions of records — parsed invoice lines, embeddings metadata, graph nodes — this is often the single highest-leverage memory change available, second only to not holding them at all.
+**Under the hood.** A `PyObject` begins with `Py_ssize_t ob_refcnt` and `PyTypeObject *ob_type`; `Py_INCREF`/`Py_DECREF` macros adjust the count on every reference change, and `Py_DECREF` to zero calls the type's deallocator. The cyclic GC (`Modules/gcmodule.c`) tracks container objects in three generational linked lists, and on a collection does a mark-and-sweep *within* a generation using the refcount trick: it computes "references from *inside* the candidate set" and finds objects whose external refcount is zero → unreachable cycles → freed. Thresholds are tunable (`gc.get_threshold()`, default `(700, 10, 10)`). pymalloc (`Objects/obmalloc.c`) sits under the object allocators, managing arenas/pools/blocks for ≤512-byte requests; larger requests go straight to the system allocator. `gc.freeze()` (3.7+) moves current objects out of GC scanning so a subsequent `fork` keeps their pages CoW-shared — the modern answer to Instagram's problem (§1.9). Primary sources: the CPython Developer's Guide "Garbage collector design"; `Objects/obmalloc.c` and `Modules/gcmodule.c`; the `gc`, `sys`, and `tracemalloc` module docs. **Verify — refcounting/GC details differ on PyPy and free-threaded 3.13+ (Day 20).**
 
 ---
 
-## 7. Measuring memory: the numbers and what they actually mean
+## 1.7 System design ① — Size memory for an API deployment (limits that don't lie)
 
-**Depth: [WORKING]**
+**Depth: [CORE]** (the design), building on [WORKING] container-limit mechanics.
 
-Half of all memory incidents are misdiagnosed because someone read the wrong number. Learn the vocabulary once.
+**The problem.** You're deploying a synchronous FastAPI/Gunicorn service to Kubernetes. Each pod runs **W worker processes**; each request, while in flight, holds some memory (parsed request body, ORM objects, response buffer, per-request caches). Traffic is **λ = 300 req/s**, each request is in service **≈ 150 ms** (Day 3 §1.7's Little's Law → ~45 concurrent in flight), and each in-flight request's peak footprint is **≈ 8 MB**. What memory `request` and `limit` do you set on the pod so it (a) never gets OOM-killed under normal load, (b) doesn't waste money reserving RAM it never uses, and (c) fails *predictably* under overload?
 
-| Metric | Definition | Use it for | Trap |
-|---|---|---|---|
-| **VSZ / VMS** | total virtual address space mapped | almost nothing | Includes unpaid promises. A Go or JVM process shows tens of GiB of VSZ on a 512 MiB container. **Never alert on VSZ.** |
-| **RSS** | pages resident in RAM for this process | first-order "how big is this process" | **Double-counts shared pages.** Summing RSS across forked workers overcounts badly (§2.5). |
-| **PSS** | private pages + (each shared page ÷ number of sharers) | summing across processes on one host | Linux-specific; needs `smaps_rollup`; slightly costly to read |
-| **USS** | pages private to this process only | "how much would I get back if I killed it?" | Ignores its share of genuinely-needed shared pages |
-| **`memory.current`** (cgroup) | anon + page cache + kernel + socket charged to the cgroup | **what your container limit is compared against** | Includes page cache — much bigger than your heap (§5) |
-| **`tracemalloc`** | Python-level allocations, with tracebacks | finding *which line* grows | Misses all C-extension memory; ~2× overhead |
+**The key decision — budget from first principles, then add honest headroom.**
 
-Quick reference for reading these:
+```
+   Per-pod memory =
+       base interpreter + loaded code + libs        (≈ 150 MB for a real FastAPI app)
+     + W worker processes × per-worker baseline      (each fork ~ shares code via CoW §1.9,
+                                                        but private heap grows — budget ~80 MB each)
+     + concurrent_in_flight × per-request footprint  (Little's Law §1.7: 45 × 8 MB = 360 MB)
+     + headroom for p99 spikes & fragmentation §1.6  (Python won't return freed arenas — budget +30–50%)
 
-```console
-$ cat /proc/self/status | grep -E 'VmSize|VmRSS|VmSwap|VmData|VmStk'
-VmSize:  1064960 kB      # virtual
-VmRSS:     45120 kB      # resident (the headline number)
-VmData:   987654 kB      # heap + anonymous data
-VmStk:       132 kB      # stack
-VmSwap:        0 kB      # swapped out
-
-$ cat /proc/self/smaps_rollup | grep -E 'Rss|Pss|Private|Shared'   # per-process truth
-$ cat /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max      # container truth
-$ cat /sys/fs/cgroup/memory.events                                 # pre-OOM warning
+   Worked: 150 + (4 × 80) + 360 + ~40% headroom
+         = 150 + 320 + 360 = 830 MB  →  × 1.4 ≈ 1160 MB
+   → set memory REQUEST ≈ 1.0 GB (what you truly use at p50)
+   → set memory LIMIT   ≈ 1.5 GB (headroom for p99 without OOM)   ← the honest limit
 ```
 
-**Deeper Python tooling — Depth: [AWARE].** `memray` (Bloomberg) traces native allocations too and produces flame graphs, which is what you want when `tracemalloc` and RSS disagree. `objgraph` draws referrer chains — the "who is still holding this?" question from §6.2. `guppy3`/`heapy` and `pympler` give heap summaries. **Treat as a black box until `tracemalloc` fails you**, and it will fail you the moment the growth is inside a C extension.
+**Why request ≠ limit, and why the limit must not lie.** In Kubernetes, **request** is what the scheduler reserves (and bills you for); **limit** is the cgroup `memory.max` that triggers the OOM kill (§1.5). The classic disaster (§1.9's case study) is setting the **limit to the p50** usage — then every p99 spike (a big request, a GC pause holding memory, a burst of concurrency) crosses `memory.max` and the pod is **OOMKilled nightly**. The limit must cover your *real p99*, not your average, or the limit is a lie the OOM killer will call. Equally, setting the limit *absurdly high* wastes the node's schedulable capacity and lets a genuine leak (§1.6) grow huge before it's caught. The limit is a contract: "this pod will never legitimately need more than X" — measure X at p99, don't guess it at p50.
 
-### Runnable example — the streaming fix, measured
+**The trade-off, and what happens when you guess wrong.**
 
-The syllabus's build task ends with "fix it with streaming/chunked processing." Here is that fix on a realistic shape — parsing a large delimited file — with the memory difference measured rather than asserted.
+```
+   limit = p99 + headroom (right) : survives spikes; OOM only on genuine leaks/runaway → alerts, restart
+   limit = p50 (too low)          : §1.9's nightly OOMKill loop → CrashLoopBackOff → dropped requests
+   limit = 10× p99 (too high)     : one leaking pod eats a whole node before OOM; poor bin-packing; wasted $
+   request ≪ limit (overcommit)   : node schedules many pods by request, they all spike together →
+                                    NODE-level OOM → kernel kills pods by oom_score, maybe the wrong one (§1.5)
+```
+
+**Failure modes & mitigations.**
+
+| Failure | Cause | Mitigation |
+|---|---|---|
+| Nightly OOMKill / CrashLoopBackOff | limit set at p50, p99 spikes exceed it (§1.9) | measure p99 RSS; set limit above it; cap per-request footprint |
+| RSS grows all day, then OOM | a real leak — lingering reference (§1.6) | tracemalloc diff in prod (§1.6); bound caches (LRU with max size) |
+| Node-level OOM kills wrong pod | requests set far below limits → overcommit (§1.5) | set request close to limit for critical pods; `oom_score_adj` / QoS class Guaranteed |
+| Memory "won't go down" after a spike | pymalloc keeps arenas (§1.6) | expected — size for peak, not "after GC"; or periodic worker recycle (`--max-requests`) |
+| Per-worker memory multiplies | forgot forks don't share private heap (§1.9) | fewer, fatter workers + threads/async for I/O concurrency (Day 3 §1.6) |
+
+**Why this over the alternatives?** You *could* set no limit and rely on the node — but then one leaking pod starves its neighbors and the kernel picks the OOM victim by `oom_score`, not by fault (§1.5). Explicit, p99-based per-pod limits contain the blast radius to the guilty pod and make failures *predictable* (this pod restarts) instead of *collateral* (a healthy pod dies). **Cross-reference:** Part 2 §2.4 applies this exact budgeting to an LLM inference/agent server, where the per-request footprint is dominated not by 8 MB of ORM objects but by the **KV cache** (§2.2) — often *gigabytes* per concurrent request — flipping the arithmetic by two orders of magnitude.
+
+---
+
+## 1.8 System design ② — Diagnose and stop a slow memory leak in a long-running service
+
+**The problem.** A Python service's RSS climbs steadily over days — 400 MB on Monday, 1.2 GB by Thursday — then it's OOM-killed and restarts, resetting the clock. No single request is huge; memory just never comes back down. Design a systematic approach to (a) confirm it's a real leak vs. expected pymalloc arena retention (§1.6), (b) *locate* the leaking allocation without guessing, and (c) mitigate immediately while you fix the root cause.
+
+*(Distinct from §1.7: that *sizes* memory for steady-state load; this one *hunts* a growth-over-time pathology. Different problem — a detective task, not a capacity calculation.)*
+
+**Key decision 1: confirm it's a leak, not arena retention.** A one-time spike that plateaus is *not* a leak — it's pymalloc holding arenas (§1.6), which is fine. A **leak** grows *monotonically with work done* (per request, per loop iteration) and never plateaus. Confirm by plotting RSS over time against request count: flat-after-warmup = healthy; linear-with-requests = leak. This distinction saves you from "fixing" normal behavior.
+
+**Key decision 2: locate it with tracemalloc snapshot diffing (§1.6), in production.** The only reliable method: take a `tracemalloc` snapshot, let the service handle N requests, take another, `compare_to(..., "lineno")`, and read the top grower — the allocation site whose bytes climb every diff *is* the leak. This is the §1.6 runnable, deployed: expose an admin endpoint that dumps the top-10 growers, or log them periodically. `objgraph.show_growth()` (finds which *object types* are proliferating) and the `gc` module (`gc.get_referrers(obj)` to find *what* is holding the lingering reference) complete the toolkit. The root cause is almost always one of: an **unbounded cache** (a `dict` used as a cache with no eviction), a **growing global/class attribute**, a **closure or event handler** capturing large objects, or **accumulating exception tracebacks** (which hold frame references, hence every local, alive).
+
+**Key decision 3: mitigate now, fix later.** Two immediate levers: (a) **bound every cache** — replace naked `dict` caches with `functools.lru_cache(maxsize=N)` or an explicit LRU with a hard cap, so growth is capped by design; (b) **recycle workers** — Gunicorn's `--max-requests` (and `--max-requests-jitter`) restarts each worker after N requests, resetting its memory. Worker recycling is a legitimate *stopgap* (many production Python services run it permanently as insurance against slow leaks in dependencies) but it treats the symptom — find the reference with tracemalloc and fix the root cause.
+
+**Trade-off made.** Worker recycling trades a tiny amount of throughput (periodic restart cost, cold caches after restart) for bounded memory — a deliberate "cap the blast radius while we debug" choice. `lru_cache(maxsize=N)` trades some cache hit rate (evicted entries recomputed) for a hard memory ceiling. Both accept slightly worse best-case performance for a guaranteed worst case — the right trade for a service that must not OOM.
+
+**Failure modes & mitigations.**
+
+| Failure | Cause | Mitigation |
+|---|---|---|
+| "Fixed" a leak that wasn't one | mistook pymalloc arena retention for a leak (§1.6) | confirm monotonic-with-work growth first |
+| tracemalloc overhead in prod | tracing every allocation is costly | sample (`tracemalloc.start(nframe)` small); enable on one canary pod |
+| Leak is in a C extension | tracemalloc only sees Python allocations | use `valgrind`/`memray` (tracks C allocations) for native leaks |
+| Cache bounded but hit rate craters | `maxsize` too small | size the cache to the working set; monitor hit rate |
+| Leak returns after "fix" | fixed one reference, another remains | diff again after the fix; leaks often come in families |
+
+**Why this over the alternatives?** Guessing ("it's probably the cache") wastes days and often fixes the wrong thing. `tracemalloc` diffing is *evidence-based* — it names the file and line. Restarting workers blindly hides the leak forever and masks a possibly-worsening bug. The disciplined path — confirm, locate with evidence, bound + recycle as a stopgap, fix the reference — is faster and permanent. **Cross-reference:** the agent version of this exact leak is §2.3 — an agent whose conversation history or scratchpad grows every turn is a lingering reference that leaks both RSS *and* tokens, hunted with the same tracemalloc method.
+
+---
+
+## 1.9 Case studies
+
+### ① Instagram disabled Python's garbage collector to reclaim copy-on-write memory
+
+**What happened.** Instagram runs its Django/Python web servers with a **pre-fork** model (Day 2, Day 3 §1.9): a master process loads all the code and warms caches, then `fork`s many worker processes to handle requests. `fork` uses **copy-on-write** (CoW): the children initially *share* the parent's physical pages, and a page is only privately copied when a child *writes* to it — so, in theory, hundreds of workers share one copy of the (large, read-only) code and warmed data, saving gigabytes. Instagram observed the opposite: **shared memory steadily eroded** over each worker's life — pages that should have stayed shared were being copied private, RSS ballooned, and they fit fewer workers per machine.
+
+**The mechanism (a direct §1.6 + §1.3 payoff).** The culprit was CoW being triggered on pages the workers only *read*. Two Python-specific causes: (a) **reference counts live in every object's header** (§1.6), and CPython increments/decrements them even on read — so a worker merely *touching* a shared object writes its refcount, dirties the page, and forces a private copy (§1.3's CoW fault); (b) the **cyclic GC**, when it ran, walked and marked large numbers of long-lived objects, touching their GC headers and dirtying still more shared pages. Instagram's most impactful single change was to **disable the cyclic GC entirely** (`gc.disable()`), which stopped the GC-driven page dirtying; they reported roughly a **10% memory reduction** and better CoW sharing across workers (and, being fork-heavy and short-per-request, they didn't accumulate problematic cycles). The refcount-in-header problem is deeper and led CPython to add **`gc.freeze()`** (3.7+) — call it after warmup and before forking to move long-lived objects out of GC's scan set so their pages stay shared.
+
+**The engineering lesson (tied to today).** This is §1.6's "the coat-check writes on every glance" broken-analogy point, made corporate: in a language where *reading* an object mutates its memory (the refcount), the OS's copy-on-write optimization (§1.3) silently defeats itself across forked workers, and a "garbage collector" that helps single-process memory can *hurt* multi-process memory by dirtying shared pages. The general principle: **understand your allocator and your fork/CoW interaction before you scale horizontally** — the same code that's memory-efficient in one process can waste gigabytes across a fork farm. Primary source: Instagram Engineering, "Dismissing Python Garbage Collection at Instagram" (2017) and "Copy-on-write friendly Python garbage collection" — **verify current details**; CPython's fork/CoW behavior and `gc.freeze` semantics have evolved, and free-threaded builds (Day 20) change the refcount story again.
+
+### ② The Kubernetes nightly OOMKill loop — a limit sized at p50 vs a p99 workload
+
+**What happened (the canonical shape, not a single named public postmortem).** A team deploys a Python service to Kubernetes and sets the pod's memory **limit** based on what they observed in a load test at *typical* load — its **p50** RSS, say 512 MB. It runs fine for hours. Then, every night during a scheduled batch job (or a traffic spike, or a report-generation endpoint), a subset of requests each hold much more memory transiently, the pod's RSS crosses **512 MB `memory.max`**, and the **cgroup OOM killer** (§1.5) `SIGKILL`s the process. Kubernetes sees the container die with exit code **137**, marks it **OOMKilled**, restarts it — and because the cause is structural (the p99 workload always exceeds the p50 limit), it happens again the next night: a recurring **CrashLoopBackOff**-adjacent pattern where the pod is healthy most of the time and killed on every spike, dropping in-flight requests each time (no graceful shutdown — §1.5's uncatchable kill).
+
+**The engineering lessons (every one a direct application of today).**
+
+1. **A container limit is a hard `memory.max` OOM trigger, not a suggestion (§1.5).** Unlike `RLIMIT_AS` (§1.5's catchable `MemoryError`), crossing a cgroup limit is an **uncatchable `SIGKILL`** — no exception, no cleanup, in-flight requests lost. You cannot "handle" it in code; you can only *size for it*.
+2. **Size limits at p99, not p50 (§1.7).** Memory usage is a distribution, not a number. The limit must cover the realistic peak (big requests, GC pauses holding memory, concurrency bursts, pymalloc arena retention §1.6), or every excursion above the mean kills the pod. "It was fine in the load test" tests the mean; production runs the tail.
+3. **`requests` vs `limits` and the QoS trap (§1.5).** If many pods have `requests` far below `limits`, the node is **overcommitted** — the scheduler packs pods by request, they spike together, and the *node* runs out, invoking the kernel OOM killer, which may kill a *different, innocent* pod by `oom_score`. Pods in the **Guaranteed** QoS class (request == limit) are last to be killed; critical services should be Guaranteed.
+4. **`OOMKilled` + exit 137 is a specific, recognizable signature.** When you see it, the diagnosis is immediate: the process touched more memory than its cgroup allowed. The fix is either raise the limit to the real p99, cap the per-request footprint (§1.7), or fix the underlying leak (§1.6/§1.8) if RSS grows monotonically rather than spiking.
+
+**Per Principle 7:** this is the *canonical, ubiquitous shape* of Kubernetes memory incidents rather than one specific named company postmortem, so I present it as the well-documented pattern it is (visible in countless k8s troubleshooting guides and the official docs) and do not attribute it to an invented named outage. The mechanism — cgroup `memory.max` → OOM kill → exit 137 → restart — is exactly documented. Primary sources: Kubernetes docs, "Assign Memory Resources to Containers and Pods" and "Node-pressure Eviction"; `Documentation/admin-guide/cgroup-v2.rst` (memory controller); the `OOMKilled` reason in `kubectl describe pod`. **Verify current** — cgroup v1→v2 and k8s swap support have changed the details across versions.
+
+---
+
+## 1.10 In production (Part 1)
+
+**Best practices, beginner → senior.**
+
+| Level | Habit |
+|---|---|
+| Beginner | Know `VmRSS` (physical) ≠ `VmSize` (virtual) — watch RSS, not VIRT (§1.1). Understand a Python "leak" is a lingering reference, not lost memory (§1.6). Don't expect `del` to shrink RSS (§1.6). |
+| Intermediate | Set container memory `limit` at measured **p99**, not p50 (§1.7, §1.9). Bound every cache (`lru_cache(maxsize=…)`) — an unbounded cache is a designed leak (§1.8). Recognize exit 137 / `OOMKilled` instantly (§1.9). Use `tracemalloc` diffs to locate leaks, never guess (§1.6, §1.8). |
+| Senior | Budget memory from first principles (base + per-worker + Little's-Law concurrency × per-request footprint + honest headroom, §1.7). Understand fork/CoW interaction with refcounts before scaling horizontally (§1.9); `gc.freeze()` after warmup. Prefer bounded working sets and streaming over "load it all" (the Build). Set QoS/`oom_score_adj` so the OOM killer sacrifices the right process (§1.5). |
+
+**Monitoring & observability — what to watch.**
+
+1. **RSS / `working_set_bytes` per pod vs its limit** (`kubectl top`, cAdvisor, `/proc/self/status` `VmRSS`). RSS approaching the limit = OOMKill imminent (§1.5). Working-set climbing monotonically with requests = a leak (§1.8).
+2. **Major page-fault & swap-in rate** (`vmstat 1` `si`/`so`; per-process `maj_flt`). Nonzero sustained = thrashing / memory pressure (§1.3) — worse than a clean OOM.
+3. **OOMKill events & restart counts** (`kubectl get events`, container `OOMKilled` reason, exit code 137). Any = under-sized limit or a leak (§1.9).
+4. **GC stats** (`gc.get_stats()`, collection counts/durations). Frequent gen-2 collections or long pauses = many long-lived cyclic objects (§1.6) — consider `gc.freeze()` or reducing cycle creation.
+5. **Per-endpoint memory footprint.** Which routes allocate the most per request (feeds §1.7's per-request footprint number). A single endpoint loading a whole file into RAM is the classic culprit — stream it (the Build).
+
+**Failure modes & first move.**
+
+| Symptom | Likely cause | First move |
+|---|---|---|
+| Pod restarts, exit 137, `OOMKilled` | RSS crossed cgroup limit (§1.5/§1.9) | check if spike (raise limit to p99) or monotonic growth (leak → §1.8) |
+| RSS climbs all day, never drops | lingering reference — a leak (§1.6/§1.8) | tracemalloc snapshot diff; find & bound the reference/cache |
+| Latency exploded overnight, CPU normal | swapping / major faults (§1.3) | check `vmstat` `si/so`; reduce working set or add RAM; disable swap for decisive OOM |
+| `del` / GC ran but RSS didn't shrink | pymalloc keeps arenas (§1.6) | expected — size for peak; recycle workers (`--max-requests`) if it must return |
+| Forked workers use far more RAM than expected | CoW broken by refcount/GC page-dirtying (§1.9) | `gc.freeze()` after warmup; measure `Pss` not `Rss`; fewer fatter workers |
+
+**Scaling behaviour.** Memory scales with *concurrency × per-request footprint* (§1.7), so the same tricks that bound concurrency (Day 3 §1.7 pools, backpressure) bound memory. Per-connection memory is why C10K (Day 3 §1.6) is a *memory* story as much as a scheduling one. **Cost.** RAM is the expensive, hard-capped resource in most deployments — you pay for reserved `requests` whether used or not, and the OOM killer enforces `limits` without mercy. The cheapest memory is the memory you never allocate: stream instead of buffering, bound every cache, and keep the working set below RAM so you never touch swap.
+
+---
+
+## 1.11 Failure modes & common misconceptions (Part 1)
+
+| Misconception | Reality |
+|---|---|
+| "Allocating memory reserves physical RAM." | It reserves *virtual* address space; physical RAM is delivered lazily on first touch — page fault (§1.1, §1.3). |
+| "A pointer is a physical RAM address." | It's a *virtual* address, translated per-access by the MMU/TLB; the same virtual address differs across processes (§1.1). |
+| "`del x` returns memory to the OS." | It drops a reference; the object frees inside Python, but pymalloc often keeps the arena — RSS may not drop (§1.6). |
+| "A Python memory leak is lost memory." | It's a *lingering reference* — something still points at it, so the GC can't reclaim it (§1.6, §1.8). |
+| "Reference counting handles everything." | It can't free reference *cycles*; that's why CPython also has a cyclic GC (§1.6). |
+| "The GIL/refcount makes fork+CoW memory-efficient." | Refcounts written on read dirty shared pages, breaking CoW across workers (Instagram, §1.9). |
+| "Set the container limit to average usage." | Sizing at p50 gets you OOM-killed on every p99 spike — set at p99 (§1.7, §1.9). |
+| "An OOM gives a catchable error." | `RLIMIT_AS` does (`MemoryError`); a cgroup/system OOM is an uncatchable `SIGKILL`, exit 137 (§1.5). |
+| "Swap prevents out-of-memory." | It defers it, but thrashing (§1.3) is slower than a clean OOM — many servers disable swap on purpose. |
+| "A Python int is 8 bytes." | It's a ~28-byte heap object (header + digits); that's the cost of everything-is-an-object (§1.6). |
+
+## 1.12 Interview & practice questions (Part 1)
+
+1. What's the difference between virtual and physical memory, and why does `VmSize` exceed `VmRSS`? *(Virtual = the address space a process sees; physical = RAM actually backing it, delivered lazily on fault — §1.1.)*
+2. Walk a page fault: what are minor, major, and invalid faults, and what does each cost? *(Map-only ~µs; disk/swap ~ms; SIGSEGV — §1.3.)*
+3. Why is a Python "memory leak" almost never lost memory? How do you find one? *(A lingering reference keeps it reachable; tracemalloc snapshot diff — §1.6, §1.8.)*
+4. Why does a Python int cost ~28 bytes, and why does that matter at scale? *(PyObject header — refcount + type ptr; a million ints ≈ 28+ MB → numpy for numeric data — §1.6.)*
+5. Reference counting frees objects immediately — why does CPython still need a GC? *(Reference cycles have nonzero refcounts forever; the cyclic GC collects them — §1.6.)*
+6. What is the OOM killer, and how does a cgroup OOM differ from a `RLIMIT_AS` failure? *(Kernel kills a process on unsatisfiable fault; cgroup = uncatchable SIGKILL/137, RLIMIT = catchable MemoryError — §1.5.)*
+7. A pod is `OOMKilled` nightly but healthy by day. Diagnose. *(Limit sized at p50, p99 spike crosses cgroup `memory.max` — §1.7, §1.9. Raise limit to p99 or cap per-request footprint.)*
+8. Why did Instagram disable Python's GC, and what does it teach about fork/CoW? *(Refcount/GC page-dirtying broke copy-on-write across workers, eroding shared memory — §1.9.)*
+9. Stack vs heap: which can leak, which overflows, and who frees each? *(Heap leaks (manual/GC), stack overflows (deep recursion); stack self-frees on return — §1.4.)*
+10. Your service's RSS won't drop after processing a big batch. Bug or expected? *(Expected — pymalloc keeps arenas; size for peak or recycle workers — §1.6.)*
+
+---
+
+# PART 2 — AGENTIC AI
+
+> **How Part 2 relates to Part 1.** An agent (the `while` loop around an LLM, Day 24) has **three** memory budgets, and all three are Part 1 concepts wearing new clothes: (1) the **process RAM** the agent runs in — ordinary §1.1–§1.6 backend memory, leaked the ordinary way (§1.6) by an unbounded history (§2.3); (2) the **context window** — the model's *token* budget, a RAM-like finite space you must manage or overflow; (3) the **KV cache** — the *GPU* memory the model server spends per concurrent request, which makes LLM inference **memory-bound** exactly the way §1.3's working set makes a server memory-bound. I treat the backend and the transformer internals as black boxes here and cross-reference Part 1 and Day 63. The recurring thesis: *an agent is a distributed backend system with one non-deterministic component (the model)* — and its memory problems are ordinary backend memory problems (§1.5–§1.8) plus one new, expensive tier (the KV cache) that no CRUD API has.
+
+## 2.1 The context window — a RAM-like budget measured in tokens
+
+**Depth: [WORKING]** — you must manage it correctly and reason about its limits and costs; the tokenizer/transformer internals are Day 59/63.
+
+### Intuition
+
+The model is stateless (Day 23): it remembers nothing between calls. "Conversation" is an illusion your backend builds by **re-sending the entire history every turn**. That history lives in the **context window** — the maximum number of **tokens** (≈ word-chunks; Day 23) the model can attend to at once (e.g. 200K tokens, verify per model). The context window is to *tokens* what RAM is to *bytes*: a **fixed, finite budget** that everything competing for the model's attention (system prompt + full history + retrieved documents + the new message + room for the response) must fit inside. Overflow it and the request **errors** (or the framework silently truncates, dropping the oldest turns — losing memory). And unlike RAM, you **pay per token, every turn** — so an unmanaged, growing context is both a *capacity* problem (you'll hit the window) and a *cost* problem (the bill grows with history length, Day 23's cost blowup).
+
+The direct mapping to Part 1: the context window is a memory budget you **allocate** (add to history), that gets **full** (approach the token limit), that you must **evict** from (trim/summarize old turns — the agent's version of §1.3's page eviction), and that leaks if you never bound it (§2.3).
+
+### Analogy — a fixed-size whiteboard the model can see
+
+The model can only "see" what's written on a whiteboard of fixed size (the context window). Each turn, you wipe it and **rewrite the entire conversation** plus the new question, because the model has no memory of last turn (Day 23). As the conversation grows, the whiteboard fills; when it's full, you must **erase old lines** to fit new ones — and whatever you erase, the model can no longer see (it "forgets"). You're charged for every character you write, every single turn.
+
+**Where the analogy breaks:** a real whiteboard's cost is one-time (write once, read many); the context window is **re-billed in full every turn** — writing "the whole conversation" onto the board *each* time means a 30-turn chat re-sends turns 1–29 thirty times, so naive history-resending makes cost grow *quadratically* with conversation length (Day 23's blowup), a cost structure no physical whiteboard has. Also, erasing a whiteboard line loses it forever; a well-built agent instead **summarizes** old turns (compressing many tokens into few) or **offloads** them to external memory/RAG (Day 43) it can retrieve later — a "spill to disk" (§1.3) the whiteboard can't do.
+
+### Worked example — the token budget of a growing conversation
+
+```
+   Context window budget (illustrative — verify limits/pricing per model, they drift):
+     total window            : 200,000 tokens
+     system prompt           :   1,500 tokens  (fixed every turn)
+     retrieved docs (RAG)    :   4,000 tokens  (Day 43)
+     conversation history    : grows ~500 tokens/turn
+     new user message        :     200 tokens
+     reserved for response   :   4,000 tokens  (max_tokens)
+     ─────────────────────────────────────────
+     usable for history = 200,000 − 1,500 − 4,000 − 200 − 4,000 ≈ 190,300 tokens
+     → at ~500 tokens/turn, the window fills after ~380 turns → then you MUST evict/summarize
+
+   Cost angle (Day 23): if you re-send full history every turn, tokens billed by turn N
+   grow linearly with N, so cumulative cost over a conversation grows ~quadratically.
+   Trimming/summarizing history is the fix — the §1.3 "eviction" of the agent world.
+```
+
+**No runnable example here** (honesty, Principle 6/7): a faithful token-budget demo requires calling a specific provider's tokenizer, which drifts fast and is Day 23's runnable surface (`client.messages.count_tokens` for Claude — consult the `claude-api` skill; `tiktoken` for OpenAI; `client.models.count_tokens` for Gemini). The *management* of that budget under concurrency is §2.3's runnable. I'm not inventing a fake tokenizer to satisfy the format.
+
+---
+
+## 2.2 The KV cache — why LLM inference is memory-bound
+
+**Depth: [WORKING]** — you must reason about its cost and why it dominates inference-server memory; the transformer attention mechanism that produces it is **Day 63** (named, not opened here).
+
+### Intuition
+
+When a model generates text, it processes tokens one at a time, and at each step attention needs the **keys and values** (K, V — Day 63's terms) computed for *every previous token*. Recomputing them every step would be quadratically wasteful, so the server **caches** them: the **KV cache**. This cache grows **linearly with sequence length** and is stored **per concurrent request** in GPU memory. The consequence, which reshapes the entire §1.7 memory-budgeting problem for LLM servers: **inference is memory-bound, not compute-bound** — you run out of GPU memory (weights + KV cache for all in-flight requests) long before you run out of compute, and the KV cache, not the model weights, is usually what limits how many requests you can serve at once.
+
+This is *why* Day 4 sits before the LLM days: the KV cache is exactly a §1.1–§1.7 memory-budget story on a scarcer, pricier tier (GPU HBM), and the state-of-the-art solution (vLLM's PagedAttention, §2.5) **literally applies OS paging (§1.2)** to it.
+
+### Analogy — a translator's running notes
+
+A simultaneous translator (the model generating) keeps **notes on everything said so far** so each new word can be translated in context. The longer the speech (sequence), the thicker the notes (KV cache grows linearly). A translation *agency* (inference server) running many simultaneous sessions needs desk space for *every* translator's notes at once — and runs out of **desk space** (GPU memory), not out of *translators' skill* (compute). Desk space is the binding constraint.
+
+**Where the analogy breaks:** the translator's notes are cheap paper; KV-cache memory is **the scarcest, most expensive resource in the system** — GPU HBM measured in tens of GB costing thousands of dollars, so "desk space" here is the dominant cost driver, not an afterthought. And crucially, classic serving **pre-reserved** a full max-length notepad per session even if the speech was short (massive internal fragmentation, §1.6-like waste) — the exact inefficiency PagedAttention (§2.5) fixes by paging the notes. The paper analogy has no "you had to reserve a 2000-page notebook for a 10-word sentence" waste.
+
+### Worked example — the KV-cache memory formula and why it dominates
+
+```
+   KV cache bytes per token (per request) ≈
+       2 (K and V) × num_layers × num_kv_heads × head_dim × bytes_per_element
+
+   For a mid-size model (ILLUSTRATIVE — plug in the real config, Day 63; verify):
+     2 × 40 layers × 8 kv_heads × 128 head_dim × 2 bytes (fp16)
+       ≈ 163,840 bytes/token  ≈ 0.16 MB/token
+
+   A single request with 8,000 tokens of context:
+     8,000 × 0.16 MB ≈ 1.3 GB of GPU memory  — for ONE request's KV cache.
+
+   Serving 40 concurrent requests at 8K tokens each:
+     40 × 1.3 GB ≈ 52 GB of KV cache  — ON TOP of the model weights (tens of GB).
+   → GPU memory (not compute) caps concurrency. This is §1.7's budget on GPU HBM.
+```
+
+The shape is identical to §1.7 (`concurrency × per-request footprint + base`), but the per-request footprint is *gigabytes* and the base (weights) is tens of GB, so the arithmetic that sized a CRUD pod at 1.5 GB sizes an inference node at 80 GB — and gets it wrong catastrophically if you ignore the KV cache. **Verify every number against the actual model config and framework** (Principle 6): layer counts, head dims, grouped-query-attention `num_kv_heads`, and quantization (fp16 vs fp8) all change the constant, and they drift.
+
+**No runnable example** (honesty): a real KV-cache measurement needs a GPU and a specific inference framework (vLLM/TGI), which is Day 63's surface. Inventing GPU output would violate Principle 6. The formula above is the reasoning tool; §2.4 designs around it.
+
+---
+
+## 2.3 The agent "memory leak" — unbounded history and scratchpad growth
+
+**Depth: [CORE]** — this is §1.6's lingering-reference leak reincarnated in the agent, and it's the failure that makes long-running agents OOM *and* overspend.
+
+### Intuition
+
+An agent loop (Day 24) accumulates state every turn: the **conversation history** (grows ~500 tokens/turn, §2.1), a **scratchpad** of intermediate tool results, gathered facts, a running **cost/token tally**. If any of these grows **without a bound**, you have *simultaneously*:
+
+- a **process memory leak** (§1.6) — the history list/dict is a lingering reference that grows RSS every turn until the worker is OOM-killed (§1.5), exactly §1.8's monotonic-with-work growth;
+- a **context-window overflow** (§2.1) — the history eventually exceeds the token limit and the request errors or silently drops old turns;
+- a **cost blowup** (Day 23) — re-sending the full growing history every turn makes the per-turn bill climb and cumulative cost grow ~quadratically.
+
+One unbounded structure, three failures at once. This is the direct payoff of §1.4/§1.6/§1.8 for agent builders: *an agent that never trims its history or scratchpad is a memory leak whose symptoms are an OOM kill, a context overflow, and a runaway bill.* The fix is the same as §1.3/§1.8: **bound it** — cap history length (keep the last K turns), **summarize** older turns into a compact form (compress many tokens into few — the agent's §1.3 eviction), or **offload** to external memory/RAG (Day 43 — spill to "disk"). And guard it under concurrency exactly as Day 3 §2.2 (a scratchpad mutated by parallel tools both leaks *and* races).
+
+### Analogy — a diary you must read aloud in full before every entry
+
+Imagine you must **read your entire diary aloud** before writing each new entry, and you're charged per word read. Early on, quick. By entry 500, you spend all day reading 499 old entries before adding one — the diary (history) has grown unbounded, the reading (context) has hit the limit of what you can say in a day, and the cost (per-word charge) has exploded. The only sane strategies: keep only the **last few entries**, periodically **summarize** old ones into a paragraph, or **file** old entries in a cabinet you consult only when relevant (RAG).
+
+**Where the analogy breaks:** the diary's paper cost is trivial; the agent pays **three separate penalties** (RAM, context capacity, token cost) for the same unbounded growth, and the RAM penalty ends in a *silent SIGKILL* (§1.5) that kills the current user's conversation mid-response — the diary has no "and then you drop dead at entry 500" failure. And a diary read is sequential and cheap; re-sending history is re-billed in full every turn, so the cost is *quadratic*, not linear, in conversation length.
+
+### Runnable example — an agent history leak, measured with tracemalloc, then bounded
 
 ```python
-# streaming_fix.py — the same aggregation, bounded vs unbounded memory.
-# pip install psutil
-import csv
-import os
-import random
+# agent_history_leak.py — Linux/any OS. stdlib only (simulates an agent loop; no LLM).
+# Run:  python3 agent_history_leak.py
 import tracemalloc
-from collections import defaultdict
 
-import psutil
+# A turn's messages: a user msg + a tool result blob (stand-in for real content, Day 24).
+def make_turn(i):
+    return [
+        {"role": "user", "content": f"question {i}"},
+        {"role": "assistant", "content": "x" * 50_000},   # ~50 KB of accumulated result/history
+    ]
 
-PATH = "orders.csv"
-ROWS = 800_000
-proc = psutil.Process(os.getpid())
+# ---------- 1) UNBOUNDED: history grows every turn -> a leak (§1.6/§1.8) ----------
+def run_unbounded(turns):
+    history = []                          # a lingering reference that only ever grows
+    for i in range(turns):
+        history.extend(make_turn(i))      # never trimmed -> RSS + tokens climb forever
+    return history
 
+# ---------- 2) BOUNDED: keep only the last K turns (evict old -> §1.3) ----------
+def run_bounded(turns, keep_last=5):
+    history = []
+    for i in range(turns):
+        history.extend(make_turn(i))
+        # evict: keep system-ish head + the last `keep_last` turns (2 msgs each)
+        if len(history) > keep_last * 2:
+            history = history[-keep_last * 2:]   # summarize-in-real-life; truncate here
+    return history
 
-def make_file() -> None:
-    if os.path.exists(PATH):
-        return
-    random.seed(0)
-    with open(PATH, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["order_id", "customer", "amount", "note"])
-        for i in range(ROWS):
-            w.writerow([i, f"cust-{i % 5000}", round(random.uniform(1, 999), 2), "x" * 60])
+tracemalloc.start()
+snap0 = tracemalloc.take_snapshot()
+h1 = run_unbounded(200)
+snap1 = tracemalloc.take_snapshot()
+h2 = run_bounded(200, keep_last=5)
+snap2 = tracemalloc.take_snapshot()
 
-
-def totals_buffered() -> dict[str, float]:
-    """Load everything, then aggregate. Memory ~ file size."""
-    with open(PATH, newline="") as f:
-        rows = list(csv.DictReader(f))          # <-- the whole file, as dicts
-    out: dict[str, float] = defaultdict(float)
-    for r in rows:
-        out[r["customer"]] += float(r["amount"])
-    return dict(out)
-
-
-def totals_streamed() -> dict[str, float]:
-    """Aggregate as we read. Memory ~ number of distinct customers."""
-    out: dict[str, float] = defaultdict(float)
-    with open(PATH, newline="") as f:
-        for r in csv.DictReader(f):             # <-- one row alive at a time
-            out[r["customer"]] += float(r["amount"])
-    return dict(out)
-
-
-def measure(fn) -> None:
-    rss0 = proc.memory_info().rss
-    tracemalloc.start()
-    result = fn()
-    cur, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    rss1 = proc.memory_info().rss
-    print(
-        f"{fn.__name__:<18} peak(traced)={peak / 2**20:8.1f} MiB   "
-        f"RSS delta={(rss1 - rss0) / 2**20:8.1f} MiB   keys={len(result)}   "
-        f"checksum={sum(result.values()):.2f}"
-    )
-
-
-make_file()
-print(f"file size = {os.path.getsize(PATH) / 2**20:.1f} MiB, {ROWS:,} rows\n")
-measure(totals_streamed)
-measure(totals_buffered)
+grow_unbounded = sum(s.size_diff for s in snap1.compare_to(snap0, "filename"))
+grow_bounded   = sum(s.size_diff for s in snap2.compare_to(snap1, "filename"))
+print(f"UNBOUNDED history after 200 turns : {len(h1):>4} msgs, "
+      f"+{grow_unbounded/1024/1024:5.1f} MB retained   <- the leak (§1.6/§1.8)")
+print(f"BOUNDED   history after 200 turns : {len(h2):>4} msgs, "
+      f"+{grow_bounded/1024/1024:5.1f} MB retained   <- capped: RAM, context, and cost all bounded")
+print(f"unbounded would also OVERFLOW the context window (§2.1) and grow cost ~quadratically (Day 23)")
 ```
 
-Output (one run):
-
-```console
-$ python streaming_fix.py
-file size = 63.4 MiB, 800,000 rows
-
-totals_streamed    peak(traced)=     0.6 MiB   RSS delta=     0.7 MiB   keys=5000   checksum=200152318.34
-totals_buffered    peak(traced)=   839.7 MiB   RSS delta=   836.2 MiB   keys=5000   checksum=200152318.34
-```
-
-**Why this works, and why the ratio is so violent.**
-
-- Both functions compute the **identical** answer — the matching checksums are the proof, and you should always include one when you refactor for memory, because the classic bug in a streaming rewrite is a subtly wrong aggregate.
-- `csv.DictReader` is a **generator**: it yields one `dict` per row and, if you don't keep it, that dict's refcount drops to zero and it is freed before the next row is read. Peak live memory is one row plus the output dict. `list(...)` is the single character-level difference that changes the algorithm's space complexity from **O(distinct customers)** to **O(rows)**.
-- **839 MiB from a 63 MiB file — 13×.** That's §6.1 in action: each row becomes a `dict` (~184 B header + hash table) plus four `str` objects (~50–110 B each), so a 79-byte line of text becomes ~1 KiB of Python objects. **The blow-up factor from "bytes on disk" to "Python objects in RAM" is routinely 10–20×, and every capacity plan that ignores it is wrong.**
-- The RSS delta tracks the traced peak closely here, which tells you the growth is Python objects rather than C buffers (§7's cross-check).
-- Generalize the pattern: **any `.read()`, `.readlines()`, `list(...)`, `.all()`, or `await response.json()` on unbounded input is the same bug.** The fixes are the same family: iterate, chunk, use server-side cursors (`yield_per` / `stream_results`), use `iter_content`/`aiter_bytes`, and push aggregation into the database when you can.
-
-### 7.1 The concurrency multiplier — the arithmetic everyone forgets
-
-Peak memory of a service is not per-request memory. It is:
+Actual output (CPython, Linux; exact MB vary):
 
 ```
-peak_rss  ≈  baseline (interpreter + imports + model + caches)
-           + concurrency × peak_per_request
-           + allocator_slack
-           + page_cache_charged_to_the_cgroup
+# -> UNBOUNDED history after 200 turns :  400 msgs, + 19.1 MB retained   <- the leak (§1.6/§1.8)
+# -> BOUNDED   history after 200 turns :   10 msgs, +  0.0 MB retained   <- capped: RAM, context, and cost all bounded
+# -> unbounded would also OVERFLOW the context window (§2.1) and grow cost ~quadratically (Day 23)
 ```
 
-`concurrency` is the tricky term, because it is set by whichever of these is smallest — and people usually count only one:
+**Why this works, line by line.**
 
-- your web server's worker/thread count (`gunicorn -w 8 --threads 4` ⇒ up to 32),
-- your `asyncio` in-flight task count (unbounded by default — **this is the common one**),
-- your DB connection pool size,
-- your own semaphores.
+- `run_unbounded` does `history.extend(...)` every turn and **never trims** — the `history` list is a lingering reference (§1.6) that grows ~100 KB/turn. After 200 turns it retains ~19 MB in-process (and, in a real agent, this history is *re-sent to the model every turn* — so it's simultaneously a context-window filler (§2.1) and a per-turn cost multiplier, Day 23). This is precisely §1.8's monotonic-with-work growth — a leak — but in an agent the same structure *also* blows the token budget and the bill. One bug, three failures.
+- `tracemalloc.compare_to` (the §1.6/§1.8 tool) measures the retained growth of each phase, proving the unbounded run holds ~19 MB while the bounded run holds ~0 — the *evidence-based* leak diagnosis applied to the agent.
+- `run_bounded` **evicts** old turns (`history[-keep_last*2:]`), keeping only the last 5 turns, so retained memory stays flat regardless of conversation length — the agent's §1.3 page-eviction. In production you'd **summarize** the evicted turns into a short note (compressing tokens, preserving meaning) or **offload** them to a vector store (Day 43) rather than hard-truncating; the principle is identical — *bound the working set*.
+- **Honesty caveat:** this uses in-process lists as a stand-in for real conversation state and hard-truncation as a stand-in for summarization; a real agent's history lives in a DB (Day 38) keyed by session, is trimmed/summarized with a real token budget (§2.1, Day 23's `count_tokens`), and must be guarded by a per-session lock if parallel tools mutate it (Day 3 §2.2). The *memory principle* — unbounded history is a leak; bound it — is exact and framework-agnostic.
 
-In an `async` service with no admission control, `concurrency` is "however many requests arrive at once," which is not a number you chose. **A memory limit without a concurrency limit is not a limit.** That observation is the spine of both system-design scenarios below, and of Part 3.
+**The rule for agent builders.** *Every accumulating agent structure — conversation history, scratchpad, gathered facts, cost tally, memory store — must have a bound (max turns/tokens), an eviction policy (drop or summarize oldest), or an offload target (external memory/RAG).* An agent without one is §1.8's leak with §2.1's overflow and Day 23's cost blowup stacked on top — and because the RAM failure is §1.5's uncatchable OOM kill, it ends the user's conversation without warning. This is §1.7/§1.8 discipline (bound the working set; hunt leaks with tracemalloc) applied to the agent.
 
-<!-- APPEND-HERE -->
+---
 
+## 2.4 System design — memory budgeting for an LLM inference / agent server
+
+**The problem.** Design the memory budget for a GPU-backed LLM inference server (the black box behind your agent's model calls, Day 23) that serves many concurrent agent sessions. Requirements: (a) never OOM the GPU (an OOM here kills *all* in-flight requests on that GPU — §1.5 at GPU scale); (b) maximize concurrency (requests served at once) within the GPU's fixed HBM; (c) handle variable-length contexts (§2.1) without pre-reserving worst-case memory per request; (d) stay within the per-turn cost/latency budget (Day 23/24).
+
+**Key decisions.**
+- **Budget = weights + KV cache × concurrency + activation/overhead** (§1.7's formula on GPU HBM). Weights are fixed (tens of GB, or less with quantization); the KV cache (§2.2) is the *variable, dominant, per-request* term. Compute the max concurrent requests as `(HBM − weights − overhead) / (KV bytes per request at target context length)`. This is §1.7's `concurrency × per-request footprint` with a gigabyte-scale footprint.
+- **Don't pre-reserve max-length KV per request** — that's the classic fragmentation waste (§2.2/§2.5): a request that ends at 200 tokens shouldn't hold a 200K-token reservation. Allocate KV **incrementally** as the sequence grows (demand paging for the KV cache — §1.3), which is exactly **PagedAttention** (§2.5).
+- **Bound context length per request** (§2.1/§2.3) — cap max tokens so one runaway session can't consume the whole GPU's KV budget (the agent-leak §2.3 defense, enforced at the server). Reject or summarize over the cap.
+- **Continuous batching** — pack multiple requests' tokens into each forward pass to keep the GPU busy (compute efficiency) *within* the memory bound; the memory ceiling, not compute, sets the batch size.
+- **Admission control / backpressure** (Day 3 §1.7) — when the KV budget is full, **queue or reject** new requests (`429`) rather than accepting one that triggers a GPU OOM killing everyone. The OOM kill (§1.5) is far worse here than a rejected request.
+
+**Trade-off.** Paged/incremental KV allocation + continuous batching + admission control is far more complex than "one request at a time, pre-reserve max length" — but the simple version wastes most of the GPU (fragmentation, §2.2) and OOMs unpredictably. You accept serving complexity for 2–4× higher throughput on the same fixed, expensive GPU (§2.5's measured result). The context-length cap trades some capability (very long conversations must summarize/offload) for a hard memory guarantee.
+
+**Failure modes.**
+
+| Failure | Cause | Mitigation |
+|---|---|---|
+| GPU OOM kills all in-flight requests | KV cache exceeded HBM (§2.2/§1.5) | admission control; cap context length; size concurrency by KV budget |
+| Low GPU utilization / wasted memory | pre-reserved max-length KV per request (§2.2) | PagedAttention — incremental, paged KV (§2.5) |
+| One long session starves others | unbounded per-request context (§2.3) | per-request token cap; summarize/offload over cap (§2.1) |
+| Throughput collapses under load | no batching; memory-bound not compute-bound (§2.2) | continuous batching within the memory ceiling |
+| Cost per turn creeps up | history re-sent unbounded (§2.3, Day 23) | trim/summarize history; prompt caching where available (verify per provider) |
+
+**Cross-reference.** This is §1.7 (memory budgeting) + §1.5 (OOM consequences) + §2.2 (the KV footprint) + §2.3 (bounding per-request state), assembled on GPU HBM. Frameworks (vLLM, TGI — §2.5) implement the paged KV cache and continuous batching for you, but knowing the §1.1–§1.7 mechanism is how you size the deployment and debug a GPU OOM. **Preview of Day 63**, which opens the transformer and KV cache to the metal.
+
+## 2.5 Case study — vLLM's PagedAttention: OS paging applied to the KV cache
+
+**What it is (real, published).** vLLM (Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP 2023) observed that classic LLM serving **pre-allocated a contiguous, max-length KV-cache region per request**, wasting 60–80% of it to internal fragmentation (short requests holding max-length reservations) and reservation for growth — the exact §2.2/§1.6 fragmentation problem. Their fix is **PagedAttention**: store the KV cache in **fixed-size non-contiguous blocks** (like OS **pages**, §1.2) and keep a **block table** per request mapping logical KV positions to physical blocks (like a **page table**, §1.2) — allocating blocks **on demand** as the sequence grows (like **demand paging**, §1.3). This eliminates the fragmentation, lets memory be shared across requests with common prefixes (copy-on-write of KV blocks — §1.9's CoW!), and packs far more concurrent requests into the same GPU HBM. The paper reports **2–4× higher throughput** than prior systems at the same latency.
+
+**The engineering lesson (a direct §1.1–§1.3 payoff).** The state-of-the-art solution to the *newest* memory problem in computing (serving LLMs) is the *oldest* idea in this note: **virtual memory** — pages, a page table, demand paging, and copy-on-write — applied to a new resource (GPU KV cache) instead of RAM. This is the strongest possible argument for why Day 4 precedes the LLM days: the abstractions the OS invented in the 1960s to manage scarce, fragmented, contiguous-address-demanding memory are *exactly* the abstractions that make LLM serving efficient in the 2020s. Understand §1.1–§1.3 and PagedAttention is obvious; skip them and it's magic. Primary source: Kwon et al., SOSP 2023 (the PagedAttention paper); the vLLM documentation and source. **Verify current** — throughput numbers and the technique's details evolve fast, and competing systems (TGI, TensorRT-LLM) implement similar paged-KV schemes.
+
+## 2.6 In production (Part 2, condensed per [WORKING] tier)
+
+- **Best practice:** bound every accumulating agent structure (history, scratchpad, cost tally) with a max size, an eviction/summarization policy, or an offload target (§2.3). Cap per-request context length at the inference server (§2.1/§2.4). Size the inference GPU budget by weights + KV × concurrency, not by compute (§2.2/§2.4). Use a framework with paged KV + continuous batching (§2.5). Guard shared agent state under concurrency (Day 3 §2.2).
+- **Top failure mode:** unbounded conversation history — the agent §2.3 leak — which OOM-kills the worker (§1.5), overflows the context window (§2.1), *and* runs up the token bill (Day 23), all from one unbounded structure. Symptom: RSS *and* cost-per-turn climb monotonically with conversation length, then a `SIGKILL`/exit-137 mid-conversation (§1.9).
+- **Monitor:** process RSS per agent worker vs its limit (OOM risk — §1.5); KV-cache utilization / GPU memory on the inference server (§2.2, OOM risk); context tokens per request and its distribution (approaching the window — §2.1); cost-per-turn tail (unbounded history — §2.3). Trace each turn's token count with its session id (Day 24's audit log) — memory/cost leaks are invisible without per-turn history-size tracking.
+
+---
+
+# PART 3 — THE BRIDGE
+
+> Parts 1 and 2 each ended at the same wall: a **finite physical memory budget** and the **OOM killer** that enforces it. Part 3 is where a backend worker (Part 1) and the agent it runs (Part 2) discover they share *one* container's memory limit, one GPU's HBM, and one `SIGKILL` when either overruns it. No new concepts here — only the interactions. (Day 27–28 put the agent behind an ASGI server; Day 63 opens the KV cache; Day 43 builds the external memory that offloads it.)
+
+## 3.1 Where the layers meet: one memory budget, two claimants
+
+A production agent runs *inside* a backend worker process (Day 27–28): the process holds the Python interpreter + libraries (§1.6), the web framework, **and** the agent's growing conversation state (§2.3) — all inside **one cgroup memory limit** (§1.5/§1.7). Trace the memory:
+
+```
+   ONE CONTAINER, ONE memory.max (§1.5) — everything below shares it:
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │  interpreter + code + libs (§1.6)          ~150 MB baseline            │
+   │  + web framework / server (Day 28)         ~ per worker                │
+   │  + PER SESSION agent state (§2.3):                                     │
+   │       conversation history (grows/turn §2.1)  ─┐                       │
+   │       scratchpad / gathered facts             │ these GROW every turn  │
+   │       cost/token tally                        ─┘ unless bounded (§2.3) │
+   │  × concurrent agent sessions (Little's Law, Day 3 §1.7; W is SECONDS)  │
+   └──────────────────────────────────────────────────────────────────────┘
+        │  and, on the SEPARATE inference server: GPU HBM = weights + KV cache
+        ▼  per concurrent request (§2.2) — its OWN memory budget, its OWN OOM
+   If total > memory.max → cgroup OOM kill (§1.5) → SIGKILL → every session dies.
+```
+
+The load-bearing observation: **an agent's per-session memory is not fixed — it grows with conversation length (§2.3)** — so the §1.7 budget (`concurrency × per-request footprint`) has a *moving* footprint. A CRUD request's 8 MB is constant; an agent session's footprint climbs every turn until bounded. Size the container for the agent's *early* footprint and long conversations will grow past `memory.max` and OOM the worker — taking *every* concurrent session on it down, not just the long one (§1.5's "victim isn't always the culprit"). This is the first thing that breaks when a growing agent runs in a container sized like a stateless API.
+
+## 3.2 The shared failure mode: an unbounded agent leaks the whole worker into an OOM kill
+
+This is the punchline of the day, unifying §1.5, §1.6, §1.8, §2.1, §2.3, and the Kubernetes case study (§1.9).
+
+Recall §1.5: a cgroup OOM is an **uncatchable `SIGKILL`** — no `MemoryError`, no cleanup, no draining in-flight work. Now put an unbounded agent (§2.3) in that container. Its conversation history grows every turn (§2.1/§2.3); RSS climbs monotonically (§1.6/§1.8's leak); eventually total process memory crosses `memory.max`; the kernel `SIGKILL`s the worker. **Every concurrent user session on that worker dies mid-response** — not just the one with the long conversation that caused it. One user's unbounded chat OOM-kills everyone else's, silently, with exit code 137:
+
+```
+   ONE worker (one process, §1.5), serving many agent sessions:
+
+   session A: 400-turn conversation, history NEVER trimmed (§2.3)  ← the leak
+        │  RSS climbs: 300 MB → 600 MB → 900 MB → ... → memory.max
+        ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │  cgroup OOM kill (§1.5): SIGKILL, exit 137, no cleanup        │
+   │  sessions B..Z (all of them): killed mid-response, lost       │
+   └─────────────────────────────────────────────────────────────┘
+   The unbounded history didn't just cost session A tokens (§2.1/Day 23).
+   It OOM-killed the whole worker and every session on it. (§1.5, §1.9, §2.3)
+```
+
+The GPU side has an identical shape one layer over: an agent that lets one session's context grow unbounded (§2.3) inflates that request's **KV cache** (§2.2) until it exceeds GPU HBM, and the **GPU OOM kills all in-flight requests on that GPU** — the same "one session starves everyone" failure, on the pricier tier. **Both fail the same way (§1.5's uncatchable kill); they fail on different memory (worker RAM vs GPU HBM).** Knowing which tells you where to put the bound:
+
+- **Worker RAM:** bound/summarize/offload conversation history and scratchpad (§2.3); size the container for the *grown* footprint at max conversation length (§1.7/§3.1); recycle workers (`--max-requests`, §1.8) as insurance; set the container limit at real p99 including long sessions (§1.9).
+- **GPU HBM:** cap per-request context length (§2.1/§2.4); use paged KV + admission control (§2.4/§2.5); reject over-budget requests (`429`) rather than OOM the GPU.
+
+## 3.3 The dependency map
+
+What each layer needs from the other's memory, and what breaks when either overruns its budget:
+
+```
+   ┌────────────────────── AGENT LAYER (Part 2) ──────────────────────┐
+   │  needs from backend:                                              │
+   │   • a process/container with enough RAM for GROWING session state │
+   │     (history + scratchpad × concurrent sessions, §3.1)            │
+   │   • a container limit sized at the GROWN p99 footprint (§1.7/§3.1) │
+   │   • bounded/summarized/offloaded history (§2.3) so RSS stays flat  │
+   │   • GPU HBM budgeted for weights + KV × concurrency (§2.2/§2.4)   │
+   │   • admission control so a full KV budget rejects, not OOMs (§2.4) │
+   └───────────────────────────┬──────────────────────────────────────┘
+                               │ hands off: a growing per-session working set
+                               │            that MUST be bounded like any §1.8 leak
+                               ▼
+   ┌────────────────────── BACKEND LAYER (Part 1) ────────────────────┐
+   │  serves back:                                                     │
+   │   • virtual memory + demand paging per process (§1.1–§1.3)        │
+   │   • a cgroup memory limit + the OOM killer that enforces it (§1.5)│
+   │   • Python's heap: refcounts, cyclic GC, pymalloc (§1.6)          │
+   │   • tracemalloc to locate the agent's leaking reference (§1.6/§1.8)│
+   └──────────────────────────────────────────────────────────────────┘
+
+   FAILURE COUPLING (how one side breaks the other):
+   • Agent history never trimmed        → §1.6/§1.8 leak → RSS → cgroup OOM (§1.5) → ALL sessions die (§3.2)
+   • Agent context grows unbounded        → KV cache (§2.2) exceeds GPU HBM → GPU OOM → all requests on GPU die
+   • Container limit sized at early footprint → long sessions cross memory.max → §1.9 OOMKill loop
+   • Backend limit sized at p50            → §1.9 → nightly OOMKill on p99 (long-conversation) spikes
+   • Refcount/GC dirties CoW pages         → §1.9 → forked agent workers waste RAM → fewer sessions/node
+   • No admission control on KV budget      → accept one request too many → GPU OOM instead of a clean 429 (§2.4)
+```
+
+## 3.4 The one sentence
+
+The agent and the backend are not two systems that each have their own memory — they are **one process inside one memory limit**, and every rule from Part 1 (physical RAM is finite and lent, not owned; a leak is a lingering reference you must bound; size limits at p99; the OOM killer is an uncatchable `SIGKILL` that takes everything with it) is *simultaneously* a backend rule and an agent rule. The agent just adds a growing working set (history) and an expensive new tier (the KV cache), so it hits the wall sooner and more expensively: a backend's forgotten global `dict` becomes an agent's un-trimmed conversation, a pod's nightly OOMKill becomes every user's chat dying mid-sentence, and the fragmentation trick the OS invented for RAM in 1962 becomes the PagedAttention that makes serving the model affordable. That is why this memory day sits so early in a plan about building agents.
+
+---
+
+# Topic-wide wrap-up
+
+## Cheat Sheet
+
+| Concept | One-line truth | Tag | § |
+|---|---|---|---|
+| Virtual memory | Each process gets a private address space; virtual → physical translated per-access | [CORE] | 1.1 |
+| Virtual vs resident | `VmSize` = promised; `VmRSS` = physically delivered (lazily, on touch) | [CORE] | 1.1 |
+| Page / page table / TLB | 4 KB pages; multi-level table maps page→frame; TLB caches translations | [CORE] | 1.2 |
+| Page fault | Minor (map, ~µs) / major (disk-swap, ~ms) / invalid (SIGSEGV) | [CORE] | 1.3 |
+| Demand paging / swap | RAM delivered on first touch; cold pages spill to disk; thrash = death | [CORE] | 1.3 |
+| Stack vs heap | Stack: small, LIFO, self-freeing, overflows. Heap: large, GC/manual, leaks | [CORE] | 1.4 |
+| OOM killer | Uncatchable SIGKILL on unsatisfiable fault; cgroup limit = exit 137 OOMKilled | [CORE] | 1.5 |
+| Everything is a PyObject | A Python int is ~28 bytes (refcount + type ptr + value) | [CORE] | 1.6 |
+| Reference counting | Frees immediately at refcount 0; a "leak" = a lingering reference | [CORE] | 1.6 |
+| Cyclic GC | Backstop for reference cycles refcounting can't free; generational | [CORE] | 1.6 |
+| pymalloc / arenas | Arena/pool/block allocator for small objects; keeps arenas → RSS won't drop | [CORE] | 1.6 |
+| Memory budgeting | base + per-worker + (Little's-Law concurrency × footprint) + p99 headroom | [CORE] | 1.7 |
+| Leak hunting | tracemalloc snapshot diff → the growing line = the leak | [CORE] | 1.8 |
+| Context window | The model's token budget; RAM-like, finite, re-billed every turn | [WORKING] | 2.1 |
+| KV cache | Per-request GPU memory growing with sequence → inference is memory-bound | [WORKING] | 2.2 |
+| Agent history leak | Unbounded history = §1.6 leak + §2.1 overflow + Day 23 cost, at once | [CORE] | 2.3 |
+| PagedAttention | OS paging (pages/page-table/demand/CoW) applied to the KV cache | [WORKING] | 2.5 |
+| One memory budget | Agent + backend share one cgroup limit; an unbounded agent OOMs all sessions | [CORE] | 3.2 |
+
+## Build This
+
+**Definition of done — virtual memory, a leak, and its fix, all measured.**
+
+1. **Virtual ≫ resident (§1.1):** `mmap` 1 GB anonymous, print `VmSize`/`VmRSS` before/after touching one page and all pages; confirm virtual jumps immediately but resident only on touch (demand paging).
+2. **Page faults (§1.3):** touch ~100 MB and print `ru_minflt`/`ru_majflt`; confirm ~25,600 minor faults (≈ MB/4 KB) and ~0 major faults; explain what a nonzero major-fault rate would mean (thrashing).
+3. **Stack vs heap (§1.4):** hit `RecursionError` on deep recursion (stack, self-guarded); grow a referenced global list and watch RSS climb (heap, not reclaimed while reachable); `del` it and note RSS may not shrink (§1.6).
+4. **Python memory (§1.6):** print `sys.getsizeof(1)` (~28); build a reference cycle with `gc.disable()`, confirm it's *not* freed, then `gc.collect()` and confirm it is; hunt a deliberate leak with a `tracemalloc` snapshot diff and read off the file:line.
+5. **OOM behavior (§1.5):** cap with `RLIMIT_AS` and catch a `MemoryError`; then run the same allocation in `docker run -m 128m` and observe the *uncatchable* SIGKILL (exit 137, `OOMKilled`) — write one paragraph on why the two differ.
+6. **The agent leak + fix (§2.3):** simulate a 200-turn agent loop with unbounded history (measure retained MB with tracemalloc), then bounded-to-last-K history (measure again); confirm the unbounded version's memory grows with turns and the bounded version stays flat; note that unbounded would *also* overflow the context window and grow cost quadratically.
+7. **The bridge (§3.2):** run the unbounded agent loop under `RLIMIT_AS`/`docker -m` and watch the whole "worker" die — connect it to "every session on this worker dies."
+
+Assemble into one repo, commit, and write a one-paragraph explanation of *why* each number came out as it did.
+
+## Active Recall & Self-Test (answer from memory)
+
+1. Explain virtual memory to someone who thinks a pointer is a physical RAM address. Why does `top` show VIRT ≫ RES?
+2. Trace a page fault. What are the three kinds, and what does each cost? Which one is a "segfault"?
+3. Why is a Python "memory leak" almost never lost memory? How do you *find* one with evidence?
+4. Why does CPython need a garbage collector when it already refcounts? Give the exact case refcounting can't handle.
+5. Why does a Python int cost ~28 bytes? Why does `del x` often not shrink RSS?
+6. What is the OOM killer? How does a cgroup/container OOM differ from a `RLIMIT_AS` failure, and what's exit code 137?
+7. A pod is OOMKilled every night but healthy by day. Diagnose and fix, using p50/p99.
+8. Why did Instagram disable Python's GC? What does it reveal about refcounts and copy-on-write?
+9. Why is LLM inference memory-bound, and what is the KV cache? How does PagedAttention fix its waste?
+10. Your agent's conversation history is never trimmed. Name the *three* simultaneous failures and the fix.
+
+**60-second teach-back prompt:** *"Explain to a smart friend who's never coded why every program is told it owns all the RAM (a lie the OS maintains with 'pages'), what actually happens when a program uses more memory than exists (the OOM killer), and why an AI agent that never forgets old messages is the exact same 'ran out of memory' bug as a backend that never clears a growing list — using the 'hotel room numbers' and 'read your whole diary before each entry' analogies."*
+
+## Spaced-Repetition Flashcards
+
+- **Q:** Virtual vs physical memory? **A:** Virtual = the private address space a process sees; physical = RAM backing it, delivered lazily per-page on fault. Same virtual address ≠ same physical in two processes.
+- **Q:** `VmSize` vs `VmRSS`? **A:** VmSize = virtual (promised); VmRSS = resident (physically used). VIRT ≫ RES because most virtual pages are untouched promises.
+- **Q:** Page-fault types? **A:** Minor (map an in-RAM page, ~µs), major (read from disk/swap, ~ms), invalid (no VMA → SIGSEGV).
+- **Q:** Why is random memory access slow beyond cache? **A:** TLB misses → multi-level page walks; and swapping if the working set exceeds RAM.
+- **Q:** Stack vs heap — who frees, which leaks? **A:** Stack self-frees on return (overflows on deep recursion); heap is GC/manual (leaks, via lingering references).
+- **Q:** What is a Python "memory leak"? **A:** A lingering reference — something still points at the object, so the GC can't reclaim it. Find it with a tracemalloc snapshot diff.
+- **Q:** Why does CPython need a GC on top of refcounting? **A:** Reference cycles keep each other's refcount above 0 forever; the cyclic GC collects them.
+- **Q:** Why is a Python int ~28 bytes? **A:** It's a heap PyObject: refcount + type pointer + digits + bookkeeping — not a bare 8-byte word.
+- **Q:** cgroup OOM vs RLIMIT_AS? **A:** cgroup = uncatchable SIGKILL, exit 137, OOMKilled. RLIMIT_AS = catchable MemoryError. Test with RLIMIT, prod behaves like cgroup — a trap.
+- **Q:** Size a container memory limit at p50 or p99? **A:** p99 (+ headroom). p50 gets you OOM-killed on every spike (the nightly OOMKill loop).
+- **Q:** Why did Instagram disable Python's GC? **A:** Refcounts/GC written on read dirtied shared pages, breaking copy-on-write across forked workers; disabling GC recovered ~10% memory.
+- **Q:** Why is LLM inference memory-bound? **A:** The KV cache grows per-token per-request and dominates GPU HBM; you run out of memory before compute. PagedAttention pages it like RAM.
+- **Q:** Unbounded agent history — what breaks? **A:** Three things at once: a RAM leak (OOM), context-window overflow, and quadratic token cost. Fix: bound/summarize/offload.
+
+## Primary Sources (verify against these)
+
+- **Virtual memory / paging:** `mmap(2)`, `proc(5)` (`/proc/[pid]/status`, `smaps`), `Documentation/vm/` in the Linux tree; Ulrich Drepper, "What Every Programmer Should Know About Memory" (2007); Gorman, *Understanding the Linux Virtual Memory Manager* (free online).
+- **Page faults / swap:** `Documentation/vm/` (page reclaim, swappiness); `vmstat(8)`; Intel SDM Vol. 3A (paging) for the MMU/TLB.
+- **Stack/heap:** `getrlimit(2)` (`RLIMIT_STACK`/`RLIMIT_AS`), `brk(2)`, `mmap(2)`; glibc malloc internals.
+- **OOM killer / cgroups:** `Documentation/admin-guide/cgroup-v2.rst` (memory controller); `Documentation/mm/` (OOM); kernel `mm/oom_kill.c`; `proc(5)` (`oom_score_adj`); Kubernetes docs "Assign Memory Resources to Containers and Pods" & "Node-pressure Eviction."
+- **Python memory:** CPython Developer's Guide "Garbage collector design"; `Objects/obmalloc.c` (pymalloc), `Modules/gcmodule.c`; the `gc`, `sys`, `tracemalloc`, `resource` module docs. (Free-threaded/PyPy differ — Day 20.)
+- **Instagram GC/CoW:** Instagram Engineering, "Dismissing Python Garbage Collection at Instagram" and "Copy-on-write friendly Python garbage collection" (2017) — verify current.
+- **KV cache / PagedAttention:** Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention," SOSP 2023; vLLM docs & source. (KV-cache internals: Day 63.)
+- **Context window / tokens / cost:** current provider docs for token counting and pricing (consult the `claude-api` skill for Claude; `tiktoken` for OpenAI; `count_tokens` for Gemini) — they drift; verify (Day 23).
+
+## Layered explanations
+
+- **10-second:** The OS lies to every program that it owns all of RAM (virtual memory), handing out real memory 4 KB at a time only when touched; use more than exists and the OOM killer terminates you with no warning — and an AI agent that never trims its conversation is that exact "out of memory" bug, plus a runaway bill.
+- **1-minute:** Virtual memory gives each process a private address space, translated to physical RAM per-access via page tables and the TLB, delivered lazily on *page faults* (touch a page → the OS maps it). Allocating is a cheap promise; using is what costs physical RAM. The stack (small, self-freeing) and heap (large, GC/manual — where leaks live) are the two regions. In Python everything is a heap object (~28-byte ints), reclaimed immediately by *reference counting* with a *cyclic GC* backstop for reference cycles; a Python "leak" is a *lingering reference*, hunted with `tracemalloc`. Exceed the machine's RAM and the *OOM killer* sends an uncatchable SIGKILL (in a container, exit 137 "OOMKilled") — which is why you size limits at p99, not p50. All of this reappears in agents: the context window is a RAM-like token budget, the KV cache makes inference memory-bound (and is literally managed with OS paging in vLLM's PagedAttention), and an agent that never bounds its history leaks RAM, overflows the context, and runs up cost — one bug, three failures, ending in an OOM kill that takes every user session with it.
+- **5-minute:** *(the note's Parts 1–3 in order: virtual memory as the illusion of private, infinite RAM (§1.1) → pages, page tables, and the TLB that translate addresses (§1.2) → page faults and swap that fill the illusion lazily (§1.3) → stack vs heap and who frees each (§1.4) → the OOM killer that enforces the physical budget with an uncatchable SIGKILL (§1.5) → Python's heap: PyObjects, refcounting, cyclic GC, pymalloc, and why RSS won't return (§1.6) → budgeting memory for a deployment (§1.7) and hunting leaks with tracemalloc (§1.8) → Instagram's GC/CoW and the Kubernetes OOMKill loop (§1.9); then the agent: the context window as a token budget (§2.1), the KV cache making inference memory-bound (§2.2), the unbounded-history leak that fails three ways (§2.3), budgeting a GPU inference server (§2.4), and PagedAttention applying OS paging to the KV cache (§2.5); then the bridge: agent and backend share one cgroup limit (§3.1), and an unbounded agent OOM-kills the whole worker and every session on it (§3.2).)*
+- **Expert:** Memory management is the OS maintaining, per process, a private virtual address space mapped to physical frames through a multi-level page table cached in the TLB, with physical backing supplied lazily via demand paging and reclaimed under pressure via LRU eviction to swap — trading a page-fault tax (minor ~µs, major ~ms, the latter catastrophic in aggregate as thrashing) for isolation, relocation, and overcommit. The physical budget is hard and enforced non-negotiably: overcommit is settled by the OOM killer's uncatchable SIGKILL, scoped per-cgroup for containers (exit 137), which makes capacity a p99-distribution problem, not a mean. Managed runtimes add a second allocator layer: CPython reclaims via eager reference counting (with a generational cyclic collector for the cycles refcounting provably cannot break) over a pooled small-object allocator (pymalloc) whose arena retention decouples in-process free from RSS return, and whose refcount-in-header mutation-on-read defeats fork/CoW sharing (Instagram). An LLM agent is this same system with two additions: a token-denominated context window that is a re-billed-per-turn working set, and a per-request KV cache that makes inference memory-bound on GPU HBM and is best managed by transplanting virtual-memory paging itself (PagedAttention) onto the accelerator — so the discipline is invariant across tiers: bound the working set, size for the tail, budget concurrency × footprint, and treat every accumulating structure as a leak-in-waiting, because the enforcement mechanism at every tier is the same merciless SIGKILL.
+
+---
+
+*End of Day 4. Next: Day 5 — The OS IV: files, I/O, and the descriptors that run the world (file descriptors, "everything is a file," buffered vs unbuffered I/O, fsync and durability, blocking vs non-blocking, and epoll — the engine inside asyncio, Nginx, and Redis).*
