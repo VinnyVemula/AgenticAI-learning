@@ -2006,3 +2006,370 @@ Each of these is something a competent-sounding person will tell you. Each is wr
 **"Design egress for private subnets calling a partner API that requires an IP allowlist."** NAT gateway per AZ, Elastic IPs allocated and protected, the addresses treated as a version-controlled interface with drift alarms, VPC endpoints for AWS-service traffic, `ErrorPortAllocation` alarmed, and the cost arithmetic. §9 ④.
 
 ---
+
+# Topic-wide wrap-up
+
+## Glossary
+
+Every term this note defined, alphabetised. These are index entries, not re-teachings — if an entry feels thin, the section that taught it is one search away.
+
+**464XLAT** — A transition mechanism (RFC 6877) that presents a working IPv4 interface to applications on an IPv6-only network by combining a client-side translator with a network-side NAT64; what most mobile carriers actually run.
+
+**ALG (Application Layer Gateway)** — Logic inside a NAT device that parses and rewrites IP addresses carried *inside* a protocol's payload (FTP, SIP), so header and body stay consistent; impossible once traffic is encrypted.
+
+**Anycast** — Announcing the same IP prefix via BGP from multiple locations so that the routing system delivers each packet to the topologically nearest one; a single address served from many places.
+
+**APIPA / link-local self-assignment** — A host's fallback of picking its own `169.254.x.x` address when DHCP does not answer (RFC 3927); seeing such an address is a diagnosis of DHCP failure, not a working configuration.
+
+**AS (Autonomous System)** — One network under a single administrative and routing policy, identified by a globally unique AS number; the unit between which BGP exchanges reachability.
+
+**AS_PATH** — The BGP path attribute listing the sequence of ASes an announcement has traversed; serves both as BGP's distance-like metric and as its loop-prevention mechanism, since a speaker discards any announcement already containing its own AS.
+
+**Basic NAT** — Address-only translation, one private address to one public address, with no port rewriting; useful for renumbering but it does not let addresses be shared.
+
+**Best-effort delivery** — IP's promise to make a genuine attempt at delivery while guaranteeing nothing about reliability, ordering, duplication, or connection state.
+
+**BGP (Border Gateway Protocol, BGP-4)** — The interdomain routing protocol (RFC 4271) by which autonomous systems advertise reachability to each other over TCP port 179; the only protocol in production for this purpose.
+
+**BGPsec** — The extension (RFC 8205) that would cryptographically validate the whole AS_PATH rather than just the origin; specified but essentially undeployed.
+
+**Broadcast address** — The all-host-bits-set address of a network, meaning "every host on this network"; unusable as a host address, and abolished entirely in IPv6.
+
+**CGNAT (Carrier-Grade NAT)** — A second layer of NAT operated by an ISP so many subscribers share one public address, typically numbering subscribers from `100.64.0.0/10`; destroys per-subscriber IP identity and makes inbound connections impossible.
+
+**CIDR (Classless Inter-Domain Routing)** — The scheme (RFC 4632) in which the network/host split is stated explicitly as a prefix length after a slash, replacing classful addressing's fixed split.
+
+**Classful addressing** — The original IPv4 design in which the leading address bits fixed the prefix length at /8, /16, or /24 (classes A, B, C); deprecated in 1993 because the fixed sizes wasted enormous space.
+
+**Control plane** — The slow, policy-aware part of a router that runs routing protocols and decides best paths, producing the RIB; deliberately deprioritised relative to forwarding, which is why traceroute hops can look slow.
+
+**Data plane** — The fast per-packet forwarding path, using the FIB; what actually moves your traffic.
+
+**Default route (`0.0.0.0/0`)** — The zero-length prefix that matches every address, used as the gateway of last resort when no more specific route exists.
+
+**DF (Don't Fragment)** — A flag bit in the IPv4 header forbidding routers from splitting the datagram; a router that must fragment a DF-set packet drops it and returns ICMP type 3 code 4 instead. Implicitly always set in IPv6.
+
+**DNS64** — Synthesising an AAAA record for an IPv4-only name by embedding the IPv4 address in a prefix (usually `64:ff9b::/96`), so an IPv6-only client can address an IPv4-only server via NAT64.
+
+**Dotted-decimal (dotted-quad)** — The display format for an IPv4 address: the single 32-bit integer chopped into four 8-bit groups written in decimal and separated by dots.
+
+**Dual-stack** — Running IPv4 and IPv6 simultaneously on the same hosts and networks; the mainstream transition strategy, and twice the configuration surface.
+
+**ECMP (Equal-Cost Multi-Path)** — Distributing traffic across several equal-length, equal-metric paths by hashing packet-header fields, so all packets of one flow take one consistent path.
+
+**Egress-only internet gateway** — An IPv6-only cloud construct that statefully permits outbound traffic and its replies while blocking unsolicited inbound; the IPv6 replacement for a NAT gateway, with no translation and no per-GB fee.
+
+**Elastic IP** — A public IPv4 address allocated to your account and held until you release it; the stability property that makes third-party IP allowlisting possible.
+
+**Endpoint-Independent Mapping** — The NAT mapping behaviour (RFC 4787's REQ-1) in which one internal address:port always maps to the same external port regardless of destination; the property that makes STUN and NAT hole punching work.
+
+**FIB (Forwarding Information Base)** — The data plane's table: only the winning route per prefix, in a form the lookup hardware wants; the table with the hard capacity limit.
+
+**Fragment Offset** — The 13-bit IPv4 header field giving a fragment's position in the original payload, measured in units of 8 bytes — which is why every fragment but the last must carry a payload that is a multiple of 8.
+
+**GTSM (Generalized TTL Security Mechanism)** — The hardening technique (RFC 5082) of sending with TTL 255 and rejecting anything arriving below 254, which proves the packet travelled at most one hop because TTL can only decrease.
+
+**Hairpinning** — A NAT's ability to let two hosts inside it reach each other via each other's *external* address:port; frequently absent, producing services reachable from the internet but not from the same LAN.
+
+**Happy Eyeballs** — The client algorithm (RFC 8305) of racing IPv6 and IPv4 connection attempts with a small head start for IPv6, which makes dual-stack tolerable and also makes broken IPv6 invisible.
+
+**Hop Limit** — IPv6's name for TTL; the honest name, since the field has always been a hop count in practice.
+
+**Hop-by-hop forwarding** — The forwarding model in which each router knows only which neighbour to hand a packet to next, so no participant knows the full path and the path exists only as an emergent property of local decisions.
+
+**Identification** — The 16-bit IPv4 header field that groups fragments of the same original datagram; combined with source, destination, and protocol to key the receiver's reassembly buffer.
+
+**IPAM (IP Address Management)** — A managed, authoritative registry of every CIDR an organisation has allocated; the practice that prevents overlapping-CIDR disasters that configuration cannot fix.
+
+**iBGP / eBGP** — Internal BGP runs between speakers inside one AS and does not modify AS_PATH; external BGP runs between different ASes and prepends the speaker's own AS number.
+
+**Interior gateway protocol** — A routing protocol for use inside one administrative domain (OSPF, IS-IS, EIGRP), optimising a metric rather than expressing policy.
+
+**IRR (Internet Routing Registry)** — Databases of who is authorised to originate which prefixes, from which providers build the customer prefix filters that would have prevented the hijacks in §11.
+
+**Link-local address** — An address valid only on the attached link and never routed: `169.254.0.0/16` in IPv4, mandatory `fe80::/10` in IPv6.
+
+**LOCAL_PREF** — The BGP attribute expressing purely local policy preference; it is compared *before* AS_PATH length, which is why BGP is a business-policy protocol rather than a shortest-path one.
+
+**Longest prefix match** — The rule that among all routing-table entries containing a destination address, the one with the longest prefix wins, unconditionally and before any metric comparison; the internet's core forwarding rule and the mechanism every BGP hijack exploits.
+
+**MANRS** — An industry commitment programme packaging the routing-security baseline (filtering, anti-spoofing, coordination contacts, published routing data).
+
+**MF (More Fragments)** — The IPv4 flag bit set on every fragment except the last, so a receiver can tell when it has the end of the set.
+
+**MSS clamping** — Rewriting TCP's negotiated maximum segment size downward so that segments fit the path MTU and fragmentation never occurs; done automatically by AWS NAT gateways.
+
+**NAPT / PAT / IP masquerading / SNAT** — Network Address/Port Translation: rewriting both source address *and* source port so many private hosts share one public address, distinguished by port. What everyone means by "NAT."
+
+**NAT (Network Address Translation)** — A middlebox that rewrites addresses (and usually ports) in transit, keeping a state table so replies can be rewritten back; a stateful device inside a stateless network, which is the source of all of its pathologies.
+
+**NAT64** — Translating IPv6 to IPv4 with source NAT so IPv6-only clients can reach IPv4-only servers; used with DNS64.
+
+**NDP (Neighbor Discovery Protocol)** — IPv6's replacement for ARP (RFC 4861), doing the same address-resolution job over ICMPv6 and multicast instead of broadcast.
+
+**Network address** — The all-host-bits-zero address of a network, naming the network itself rather than any host in it.
+
+**Paris traceroute** — A traceroute variant that holds the ECMP hash inputs constant across probes so all probes follow a single path, rather than interleaving several.
+
+**Prefix / prefix length** — A CIDR block and the count of its leading network bits; block size is 2^(32−length) and the block must start at a multiple of its size.
+
+**Private address space** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918), reserved for internal use and required to be filtered from interdomain routing.
+
+**Reassembly timeout** — The timer after which a receiver abandons an incomplete fragment set and frees its buffer, sending ICMP type 11 code 1; ~15–30 s in IPv4, a mandated 60 s in IPv6.
+
+**RIB (Routing Information Base)** — The control plane's table holding every route learned, including the losers; distinct from the FIB, which holds only the winners.
+
+**ROA (Route Origin Authorisation)** — A signed statement by an address holder that a given AS may originate a given prefix, up to a maximum prefix length.
+
+**ROV (Route Origin Validation)** — Checking BGP announcements against ROAs and dropping Invalids; about 67% of prefixes are signed but only about 12% of ASes fully enforce.
+
+**Router** — A device that forwards packets between networks by reading the IP header, decrementing TTL, consulting its FIB, and re-framing for the outgoing link; the L2/L3 boundary.
+
+**RPKI (Resource Public Key Infrastructure)** — The certificate infrastructure underpinning ROAs and ROV; validates *origin* only, never the AS_PATH.
+
+**Shared Address Space (`100.64.0.0/10`)** — The block reserved by RFC 6598 for CGNAT, created because ISPs could not safely reuse RFC 1918 space that customers were already using behind their own routers.
+
+**SLAAC (Stateless Address Autoconfiguration)** — IPv6 hosts configuring their own global addresses from a router-advertised /64 prefix with no DHCP server, made possible by the invariant /64 subnet size.
+
+**STUN / TURN** — STUN lets a host discover its own external NAT mapping so a peer can be told about it (hole punching); TURN relays traffic through a third party when the NAT's behaviour makes hole punching impossible.
+
+**Subnet mask** — A 32-bit value with network bits set to 1 and host bits to 0, the equivalent encoding of a prefix length; its only possible non-zero, non-full octet values are 128, 192, 224, 240, 248, 252, 254, 255.
+
+**TCAM (Ternary Content-Addressable Memory)** — Hardware that compares an input against every stored entry simultaneously, with per-bit "don't care" values that encode prefix host bits exactly; enables single-cycle longest-prefix lookup, and is the finite resource behind FIB capacity limits.
+
+**Trie (LPC-trie)** — The software data structure for longest-prefix lookup: walk the destination address bit by bit and remember the deepest real prefix, giving O(32) lookup independent of table size.
+
+**TTL (Time to Live)** — The 8-bit IPv4 header field decremented by every forwarding router, with the packet destroyed and ICMP Time Exceeded returned at zero; named for time but always a hop count in practice, and the mechanism that stops routing loops becoming permanent.
+
+**ULA (Unique Local Address)** — IPv6's `fc00::/7` (practically `fd00::/8`) space for internal use, the rough analogue of RFC 1918.
+
+**VPC endpoint** — A cloud construct routing traffic to provider services over the provider's own network without traversing a NAT gateway or the internet, removing both the per-GB NAT fee and the public-address requirement.
+
+**Withdrawal** — A BGP UPDATE stating that a previously announced prefix is no longer reachable via this speaker; if nobody else announces it, the prefix ceases to exist and packets to it are silently discarded.
+
+---
+
+## Cheat sheet
+
+```
+ADDRESS = ONE 32-BIT INTEGER, displayed as four decimal octets.
+          It names an INTERFACE's attachment to a network, not a machine.
+
+CIDR    block size = 2^(32 - prefix);  block must start at a multiple of its size
+        mask octets can only be: 128 192 224 240 248 252 254 255
+        network  = addr AND mask   (all host bits 0)
+        broadcast= all host bits 1
+        usable   = total - 2   (classic)  |  - 5 (AWS, Azure)  |  - 4 (GCP)
+
+        /24 = 256 (254 / 251)      /27 = 32 (30 / 27)
+        /20 = 4096 (4094 / 4091)   /28 = 16 (14 / 11)
+        /19 = 8192 (8190 / 8187)   /29 =  8 ( 6 /  3)  <- 3 usable in cloud!
+
+RANGES  10/8, 172.16/12, 192.168/16 = private (RFC1918)
+        100.64/10 = CGNAT (RFC6598)      127/8 = loopback
+        169.254/16 = DHCP FAILED         169.254.169.254 = cloud metadata
+        192.0.2/24, 198.51.100/24, 203.0.113/24 = docs (RFC5737)
+        2001:db8::/32 = IPv6 docs (RFC3849)
+
+FORWARD 1. checksum  2. TTL<=1 -> drop + ICMP 11/0  3. TTL--
+        4. LONGEST PREFIX MATCH  (metric only breaks length ties; then ECMP hash)
+        5. ARP for next hop (or dest if on-link)  6. MTU check  7. re-checksum, re-frame
+        8. forget the packet entirely
+        Ethernet dst changes every hop; IP dst never changes.
+        RIB = control plane, all routes.  FIB = data plane, winners, finite silicon.
+
+TTL     8 bits, max 255.  Linux/mac 64, Windows 128, routers 255.
+        Arrives with TTL=1 -> dies HERE.  ICMP Time Exceeded = type 11 code 0.
+        Hop count, not time, despite the name.  IPv6 calls it Hop Limit.
+
+TRACERT tracert (Windows, ICMP Echo)  |  traceroute (Unix, UDP 33434+)
+        traceroute -I (ICMP)  -T -p 443 (TCP SYN - gets furthest through firewalls)
+        * * * = no ICMP came back, NOT a broken path
+        latency can DECREASE (control-plane deprioritisation, different return paths)
+        hop RTT != that link's latency.  Read the FIRST LINE (what it resolved to).
+
+FRAG    Identification groups | DF forbids | MF "more coming" | Offset in 8-BYTE units
+        MTU 1500 - 20 hdr = 1480 payload/frag.  4000 bytes -> offsets 0, 185, 370
+        Fragment happens at ANY router; reassembly ONLY at the destination.
+        Lose one fragment -> lose the whole datagram.  DESIGN TO NEVER FRAGMENT.
+        IPv6: routers never fragment, min link MTU 1280, PMTUD mandatory,
+              reassembly timeout 60s, NEVER block ICMPv6.
+        ping -f -l 1472 works / -l 1473 fails  =>  path MTU is 1500
+
+NAT     rewrites src IP + src PORT; table keyed on the 5-tuple; recomputes L3+L4 cksums
+        TCP/UDP/ICMP only (ICMP uses the Echo Identifier as a pseudo-port)
+        LIMIT: 55,000 conns PER UNIQUE (dst IP, dst port, proto) per address on AWS
+               up to 8 addresses -> 440,000.  ALARM ON ErrorPortAllocation.
+        Mapping timeouts reap idle connections -> use keepalives
+        NAT IS NOT A FIREWALL.  CGNAT means IP is a weak identity.
+        Cost: NATGW ~$0.045/hr + ~$0.045/GB + ~$0.09/GB DTO + ~$0.02/GB cross-AZ
+              VPC endpoints bypass the NAT fee.  Public IPv4 ~$0.005/hr each.
+
+BGP     TCP 179 | OPEN UPDATE NOTIFICATION KEEPALIVE | AS_PATH = metric + loop detect
+        SELECTION: longest prefix FIRST (a pre-filter, not a tie-break), then
+                   LOCAL_PREF > AS_PATH len > ORIGIN > MED > eBGP>iBGP > IGP metric
+        LOCAL_PREF beats AS_PATH  =>  BGP routes by BUSINESS POLICY, not distance
+        WITHDRAWAL = DELETION, not degradation
+        RPKI/ROV validates ORIGIN only (~67% signed, ~12% enforcing); BGPsec undeployed
+
+ANYCAST same prefix announced from many places; routing picks nearest
+        great for UDP/DNS/CDN/DDoS absorption; hazardous for long-lived TCP (RFC4786)
+        withdraw the announcement to fail a site out (seconds, and SEES path failures)
+        vs DNS failover: routing is fast + sees network failures but coarse;
+                         DNS is cheap + flexible but cached by things you don't control
+```
+
+## Build this
+
+Three tasks. The first two are the plan's Build; the third is the one that proves you understood.
+
+**1. Trace three continents and read every hop.** Full instructions and definition of done in §6's Build. Run `tracert` to a European, an Asian, and a North American target that are *not* CDN-fronted, plus one that is, plus the `ping -i 1..4` TTL demonstration. Write down: which hops are LAN / ISP / transit; the hop where latency jumps and the distance that implies; one `* * *` and one non-monotonic latency with your explanation of each; whether each trace reached the place you aimed at.
+
+**2. Carve `10.0.0.0/16` on paper.** Full instructions and definition of done in §13. Requirements first, then the table with usable counts you computed, then the four decisions with their rejected alternatives and flip conditions.
+
+**3. Write a subnet planner and check yourself against `ipaddress`.** Runnable definition of done: a script that takes a VPC CIDR and a list of `(name, prefix_length, az)` tuples, allocates them **without overlap and without gaps at each level**, and prints for each: network address, broadcast, first and last usable under a `--reserved {2,4,5}` flag, mask, and total/usable counts. It must **raise** on an unalignable request, on an over-subscription, and on any overlap. Then assert with `ipaddress.collapse_addresses` that your allocations plus your declared free blocks collapse back to exactly the input CIDR — the test that proves your carve is complete. Bonus: a `--check-collision` flag that takes other CIDRs (on-prem, Docker's `172.17.0.0/16`, another VPC) and fails if any overlap exists.
+
+**Stretch:** measure your own path MTU with the `ping -f` bisection from §7 and explain the result; find your public egress address and compare it with your local address (§9); and run `Find-NetRoute` before and after connecting a VPN, diffing the winning prefix and the chosen source address (§4).
+
+## Active recall and self-test
+
+Answer from memory, out loud, before looking anything up.
+
+1. Why does IP demand almost nothing of the layer below it, and what would have gone wrong if it had demanded reliability?
+2. What are the three things IP promises and the four it refuses?
+3. `203.0.113.200/26` — network address, broadcast, usable range, mask, and usable count on AWS. Show the work.
+4. A packet matches `0.0.0.0/0`, `10.0.0.0/8`, and `10.0.32.0/19`. Which wins, and does the metric matter?
+5. Why can't a router detect that it is in a routing loop, and what stops the loop instead?
+6. A packet arrives at a router with TTL=1. What exactly happens, and what does the source receive?
+7. Explain how traceroute works to someone who knows only that packets have headers.
+8. You run traceroute and hops 7, 8, 9 show `* * *` but hop 10 answers. What can you conclude?
+9. Why is fragment offset measured in 8-byte units, and what constraint does that impose on fragment sizes?
+10. A router fragments a 4,000-byte payload for a 1,500-byte MTU. Give the three fragments' offsets, lengths, and MF flags.
+11. Who fragments, and who reassembles? Why are they different parties, and why did IPv6 change it?
+12. Two laptops on the same LAN both choose source port 51000 for a connection to the same server. Trace what the NAT does and why port rewriting is mandatory rather than optional.
+13. What is the NAT connection limit, precisely, including the qualifier — and construct one workload where it bites at 2,000 clients and another where it doesn't at 50,000 connections.
+14. Why is "we're behind NAT so we're secure" wrong? Give three specific reasons.
+15. Why did NAT beat IPv6 for thirty years, and what changed?
+16. What is the sequence of events in the Meta 2021 outage, and which single design decision converted a network partition into a global disappearance?
+17. In 2008, why did announcing `208.65.153.0/24` defeat YouTube's `208.65.152.0/22` everywhere, instantly? What did YouTube do at 20:18 UTC and what does that tell you about the only available defence?
+18. Anycast vs DNS-based failover: name the failure mode each one sees that the other is blind to.
+19. What does BGP compare *before* AS_PATH length, and what does that tell you about how the internet actually routes?
+20. What does RPKI/ROV validate, what does it *not* validate, and roughly how much of the internet enforces it?
+
+**Sixty-second teach-back.** Explain to a smart friend with no networking background: *"Your laptop has no address the internet can reach, yet it can load any website in the world. Explain how, and explain what stops a packet that gets lost from circling forever."* You must get through: private vs public addresses, the router rewriting addresses and remembering who for, the fact that no router knows the whole path, and the hop counter. Sixty seconds, no jargon that you don't define in the same breath.
+
+## Spaced-repetition flashcards
+
+| Q | A |
+|---|---|
+| Block size of a /26? | 2^(32−26) = 64 addresses; 62 usable classically, 59 on AWS |
+| Only possible non-zero, non-full subnet-mask octet values? | 128, 192, 224, 240, 248, 252, 254, 255 |
+| A packet matches three prefixes. Which wins? | The longest prefix, unconditionally — before any metric comparison |
+| ICMP type/code for TTL expiry? | Type 11, code 0 ("time to live exceeded in transit") |
+| ICMP type/code for "fragmentation needed, DF set"? | Type 3, code 4 — the engine of PMTUD |
+| A packet arrives with TTL = 1. What happens? | It dies at *that* router; ICMP 11/0 goes back to the source |
+| Default initial TTL: Linux / Windows / routers? | 64 / 128 / 255 |
+| Fragment offset is measured in units of? | 8 bytes — so every fragment but the last must be a multiple of 8 |
+| Who reassembles fragments? | Only the final destination. Any router may fragment. |
+| IPv6 minimum link MTU? | 1280 octets, mandated by RFC 8200 |
+| IPv6 reassembly timeout? | 60 seconds, mandated (IPv4: ~15–30 s, recommended) |
+| Do IPv6 routers fragment? | Never — source only; they send ICMPv6 Packet Too Big instead |
+| `169.254.x.x` means? | DHCP failed and the host self-assigned (RFC 3927) |
+| `100.64.0.0/10` is for? | CGNAT / Shared Address Space (RFC 6598) |
+| RFC 5737 documentation prefixes? | 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 |
+| How many addresses does AWS reserve per subnet, and which? | 5 — the first four and the last one |
+| Usable addresses in a /29 on AWS? | Three |
+| AWS NAT gateway connection limit? | 55,000 simultaneous **per unique (dst IP, dst port, protocol)** per address; up to 8 addresses |
+| Which metric reveals NAT port exhaustion? | `ErrorPortAllocation` on the NAT gateway |
+| Which protocols does a NAT gateway support? | TCP, UDP, ICMP only |
+| BGP's transport and port? | TCP, port 179 |
+| BGP's four message types? | OPEN, UPDATE, NOTIFICATION, KEEPALIVE |
+| What compares before AS_PATH length in BGP selection? | LOCAL_PREF — pure local policy, which is why BGP routes by business |
+| What does a BGP withdrawal do? | Deletes the prefix; if nobody else announces it, packets to it are discarded |
+| What does RPKI/ROV validate? | The origin AS only — never the AS_PATH. Path validation is BGPsec, undeployed. |
+| Anycast's key limitation per RFC 4786? | Long-lived stateful/TCP sessions break if routes re-converge mid-session |
+| Google's measured IPv6 adoption milestone? | Crossed 50% on 28 March 2026 (50.10%) — verify current |
+| Global IPv4 FIB size, order of magnitude? | ~1.07 million prefixes, ~79,000 ASes (11 Aug 2026) — verify current |
+| `ping -f -l 1472` succeeds, `-l 1473` fails. Path MTU? | 1500 (1472 payload + 8 ICMP + 20 IP) |
+| What did Meta's DNS servers do on 4 Oct 2021, and why? | Withdrew their own BGP routes, because a health check said they couldn't reach the data centres |
+| Windows `tracert` vs Unix `traceroute` default probe? | ICMP Echo vs UDP to ports 33434+ — so a firewall can break one and not the other |
+
+## Primary sources
+
+Verify against these rather than against this note. Items marked **drifts** change and should be re-checked before you rely on a number.
+
+**IETF specifications**
+- RFC 791 — Internet Protocol (IPv4): header, TTL semantics, fragmentation — https://www.rfc-editor.org/rfc/rfc791
+- RFC 792 — ICMP: Time Exceeded (11), Destination Unreachable (3), Echo — https://www.rfc-editor.org/rfc/rfc792
+- RFC 919 / RFC 8190 — broadcast addresses; special-purpose registry guidance
+- RFC 1112 — host extensions for IP multicast (class D/E origins)
+- RFC 1122 — Host Requirements (loopback, EMTU_R) — https://www.rfc-editor.org/rfc/rfc1122
+- RFC 1812 — Requirements for IPv4 Routers (longest-prefix match, §5.2.4.3) — https://www.rfc-editor.org/rfc/rfc1812
+- RFC 1858 / RFC 3128 — tiny-fragment attacks and the corrected mitigation
+- RFC 1918 — Private address space — https://www.rfc-editor.org/rfc/rfc1918
+- RFC 3021 — using /31 prefixes on point-to-point links
+- RFC 3022 — Traditional IP NAT (Basic NAT and NAPT) — https://www.rfc-editor.org/rfc/rfc3022
+- RFC 3849 — IPv6 documentation prefix `2001:db8::/32`
+- RFC 3927 — IPv4 link-local (`169.254/16`) autoconfiguration
+- RFC 4193 — IPv6 Unique Local Addresses
+- RFC 4271 — BGP-4 — https://www.rfc-editor.org/rfc/rfc4271
+- RFC 4291 — IPv6 addressing architecture (/64 subnets) — https://www.rfc-editor.org/rfc/rfc4291
+- RFC 4632 — CIDR — https://www.rfc-editor.org/rfc/rfc4632
+- RFC 4786 — BCP 126, Operation of Anycast Services — https://www.rfc-editor.org/rfc/rfc4786
+- RFC 4787 — NAT UDP behavioural requirements (mapping/filtering, hairpinning) — https://www.rfc-editor.org/rfc/rfc4787
+- RFC 4861 / RFC 4862 — NDP and SLAAC
+- RFC 4890 — which ICMPv6 messages firewalls must not filter
+- RFC 5082 — GTSM (the TTL=255 hardening) — https://www.rfc-editor.org/rfc/rfc5082
+- RFC 5382 — NAT behavioural requirements for TCP
+- RFC 5722 — forbidding overlapping IPv6 fragments
+- RFC 5737 — IPv4 documentation address blocks — https://www.rfc-editor.org/rfc/rfc5737
+- RFC 6052 — the `64:ff9b::/96` NAT64 prefix
+- RFC 6598 — Shared Address Space `100.64.0.0/10` for CGNAT — https://www.rfc-editor.org/rfc/rfc6598
+- RFC 6877 — 464XLAT
+- RFC 8200 — IPv6 (Hop Limit, no router fragmentation, 1280 MTU, 60 s reassembly) — https://www.rfc-editor.org/rfc/rfc8200
+- RFC 8201 — Path MTU Discovery for IPv6
+- RFC 8205 — BGPsec
+- RFC 8305 — Happy Eyeballs v2
+- RFC 8981 — IPv6 temporary (privacy) addresses
+
+**Registries and live measurement (drifts)**
+- IANA IPv4 Special-Purpose Address Registry — https://www.iana.org/assignments/iana-ipv4-special-registry/
+- Global BGP table size and AS count (Geoff Huston, AS65000) — https://bgp.potaroo.net/as2.0/bgp-active.html
+- CIDR Report — https://www.cidr-report.org/
+- Google IPv6 adoption statistics — https://www.google.com/intl/en/ipv6/statistics.html
+- NIST RPKI Monitor — https://rpki-monitor.antd.nist.gov/ ; Cloudflare's https://isbgpsafeyet.com/
+- IPv4 exhaustion announcement (NRO) — https://www.nro.net/ipv4-free-pool-depleted/ ; per-RIR dates collated at https://www.nic.ad.jp/en/ip/ipv4pool/
+
+**Vendor documentation (drifts — all numbers here need re-checking)**
+- AWS NAT gateway basics: bandwidth, PPS, the 55,000-per-destination limit, MSS clamping — https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-basics.html
+- AWS subnet sizing and the 5 reserved addresses — https://docs.aws.amazon.com/vpc/latest/userguide/subnet-sizing.html
+- AWS VPC pricing — https://aws.amazon.com/vpc/pricing/
+- AWS public IPv4 charge announcement — https://aws.amazon.com/blogs/aws/new-aws-public-ipv4-address-charge-public-ip-insights/
+- Azure Virtual Network FAQ: 5 reserved addresses, /29–/2 subnet range, IPv6 must be /64 — https://learn.microsoft.com/en-us/azure/virtual-network/virtual-networks-faq
+- Google Cloud VPC subnets: 4 reserved addresses, /29 minimum, no reservations on secondary ranges — https://cloud.google.com/vpc/docs/subnets
+
+**Incident postmortems and analyses**
+- Meta, 4 Oct 2021 — https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/ and https://engineering.fb.com/2021/10/04/networking-traffic/outage/
+- Cloudflare's BGP/DNS analysis of the same — https://blog.cloudflare.com/october-2021-facebook-outage/
+- YouTube hijack, 24 Feb 2008 — RIPE NCC RIS case study — https://www.ripe.net/about-us/news/youtube-hijacking-a-ripe-ncc-ris-case-study/
+- Verizon / BGP-optimiser leak, 24 Jun 2019 — https://blog.cloudflare.com/how-verizon-and-a-bgp-optimizer-knocked-large-parts-of-the-internet-offline-today/
+- `1.1.1.1` and the polluted-prefix story — https://blog.cloudflare.com/announcing-1111/
+- Ptacek & Newsham (1998), "Insertion, Evasion, and Denial of Service" — the canonical fragment-based IDS evasion paper
+
+## Layered explanations
+
+**Ten seconds.** Every device on the internet has a number. Routers pass packets toward the right number one step at a time, nobody knowing the whole route, and each packet carries a countdown so lost ones die instead of circling forever. There aren't enough numbers, so most devices share one via a translating box.
+
+**One minute.** An IP address is a 32-bit integer split by CIDR into a network part and a host part, so routers can hold one table row per *network* instead of one per host — the only reason the global table is about a million entries and not twenty billion. Forwarding is hop-by-hop: each router matches the destination against its table, takes the **longest** matching prefix, decrements the TTL, and hands the packet to one neighbour. No router knows the path; the path is emergent, which is why traceroute exists — it sends packets with TTL 1, 2, 3 and collects the ICMP errors from each router that kills one. There were never enough IPv4 addresses, so NAT rewrites private source addresses and ports to one shared public address and remembers the mapping. Between networks, BGP gossips reachability with a path, using business policy rather than distance, and with no authentication — which is how a single wrong announcement has repeatedly taken large parts of the internet offline.
+
+**Five minutes.** Start with the problem: in 1974 there were incompatible packet networks and no way to join them, so IP was invented as a universal envelope demanding almost nothing of the layer below — best-effort delivery and nothing else, because every guarantee demanded would have excluded some future technology. IP's address is a 32-bit integer; CIDR states explicitly how many leading bits are the network, and because blocks are powers of two aligned to powers of two, "is this address in that network?" is one bitwise AND. That hierarchy is what makes routing tractable: one table row per network. Cloud providers eat five addresses per subnet, so a /24 gives 251 and a /29 gives three — and since Kubernetes assigns an address per pod, subnet sizing is a pod-count question, not an instance-count question.
+
+Forwarding: each router verifies the checksum, drops-and-reports if TTL is 1, decrements TTL, finds every table entry containing the destination, takes the longest prefix (metrics only break length ties, then ECMP hashes the flow across equal paths), resolves the next hop via ARP, checks the MTU, re-frames, and forgets the packet. Two tables underlie this: the RIB (control plane, all routes) and the FIB (data plane, winners only, in finite silicon — which is why the routing table crossing 512,000 entries in 2014 crashed routers worldwide). Because routers keep no per-packet memory, they cannot detect loops, so TTL is the backstop: eight bits, decremented every hop, packet destroyed and ICMP Time Exceeded returned at zero. Traceroute is that safety mechanism used as an instrument, and reading its output correctly means knowing that `* * *` usually means ICMP was suppressed rather than the path being broken, that latency can legitimately decrease along a path because generating ICMP is deprioritised control-plane work, and that you are only ever seeing one direction.
+
+Fragmentation is IPv4's answer to a too-large packet: Identification groups the pieces, MF marks all but the last, Fragment Offset gives position in 8-byte units, and only the destination reassembles. Losing one fragment loses the whole datagram, so fragmentation multiplies your loss rate — and in practice fragments are widely dropped anyway, which is why IPv6 removed router fragmentation entirely, mandated a 1280-byte minimum link MTU, and made PMTUD (and therefore ICMPv6) load-bearing.
+
+IPv4 ran out — IANA's pool in February 2011, the RIRs over the following decade — and the response was NAT: rewrite source address *and* port so many hosts share one address, keeping a state table keyed on the 5-tuple. NAT saved IPv4 and damaged the internet: it broke inbound connectivity, broke end-to-end so thoroughly that QUIC had to be built on UDP, broke address-based identity (thousands of CGNAT subscribers share one address), and provides no real security despite universal belief otherwise. Its hard ceiling — 55,000 connections per unique destination per address on AWS — is the capacity limit that most often gets misdiagnosed as a third-party outage. IPv6 is the actual fix and finally crossed 50% of Google's traffic in March 2026, eighteen years after measurement began, because NAT could be deployed by one operator alone while IPv6 needed everyone.
+
+Between organisations, BGP advertises reachability plus an AS_PATH, over TCP 179, with each AS applying private policy — and LOCAL_PREF is compared before AS_PATH length, so the internet routes by business relationship, not distance. There is no origin authentication in the base protocol, and longest-prefix match is unconditional, so a more-specific announcement wins regardless of who made it. That is exactly how Pakistan Telecom's `208.65.153.0/24` beat YouTube's `208.65.152.0/22` globally in 2008 (YouTube's only defence was to announce even *more* specific /25s), and how a BGP optimiser's leaked /21s cost Cloudflare 15% of its traffic in 2019. And in October 2021, Meta's backbone went down, its DNS servers' health checks correctly concluded they were unhealthy, and each one withdrew its own BGP announcement — so Meta's nameservers ceased to exist, every resolver on earth returned SERVFAIL, and the internal tools needed to fix it were behind the same DNS. Six hours. The safety mechanism caused it. RPKI now signs about two-thirds of prefixes but only about an eighth of ASes enforce validation, and path validation does not exist in practice.
+
+**Expert summary.** IP is a deliberately impoverished service — stateless best-effort datagram delivery over a universal 32-bit (or 128-bit) name space — and every mechanism in this note is a consequence of that impoverishment. Aggregatable hierarchical addressing plus unconditional longest-prefix match makes the FIB O(table-independent) to consult and O(networks) rather than O(hosts) to hold, at the cost of address non-portability and a forwarding rule that is simultaneously the internet's efficiency mechanism and its principal security vulnerability. Statelessness forecloses in-network loop detection, so loop containment is pushed into a per-packet monotonically-decreasing counter, whose one-directionality is incidentally exploitable both as a topology-discovery oracle (traceroute) and as a one-hop distance proof (GTSM). The same statelessness makes in-path fragmentation a cost-misallocation — router CPU, destination memory, sender ignorance — which IPv6 corrected by moving fragmentation to the source, floor-mandating a 1280-byte MTU, and thereby promoting ICMPv6 from diagnostic to load-bearing. Address scarcity forced NAPT, a stateful middlebox inside a stateless architecture, whose contradictions manifest as idle-timeout connection death, per-destination port ceilings, ossification of the transport layer, and the collapse of address-as-identity; NAT's unilateral deployability beat IPv6's technical superiority for three decades, and only the internalisation of IPv4 cost reversed that. Interdomain routing is a policy-expression protocol whose distance metric is subordinate to local preference and whose trust model is vestigial: origin validation is two-thirds published and one-eighth enforced, path validation is unimplemented, and the operative control remains customer prefix filtering at provider boundaries. Anycast is the deliberate exploitation of announcement ambiguity, trading fractional control and stateful-session safety for proximity, DDoS division, and failover that is visible to the routing system rather than mediated by cached answers. The recurring architectural lesson, visible in 512k day, in the 2008 and 2019 hijacks, and most sharply in Meta 2021, is that mechanisms which are locally correct — a more-specific route, an optimiser's de-aggregation, a withdraw-on-unhealthy check — become globally catastrophic when the condition they respond to is correlated and the system has no floor.
